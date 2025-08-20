@@ -1,0 +1,243 @@
+%PDF-1.4
+%ÿÿÿÿ
+1 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+2 0 obj
+<< /Length 2876 >>
+stream
+BT
+/F1 11 Tf
+50 800 Td
+() Tj
+0 -14 Td
+(GUIA PASSO A PASSO ? IMERSÃO AUTOMAÇÃO & IA) Tj
+0 -14 Td
+(===========================================) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(Este guia instala e valida: Traefik, Portainer, Postgres, Redis, n8n \(queue mode\) e Evolution ) Tj
+0 -14 Td
+(API.) Tj
+0 -14 Td
+(Ambiente alvo: VPS Ubuntu 22.04/24.04 com Docker + Docker Compose.) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(1\) Pré-requisitos) Tj
+0 -14 Td
+(-----------------) Tj
+0 -14 Td
+(- Aponte no DNS os subdomínios para o IP da sua VPS: traefik, portainer, n8n, webhook, wa.) Tj
+0 -14 Td
+(- Acesso root via SSH.) Tj
+0 -14 Td
+(- Docker + Docker Compose instalados.) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(2\) Baixar e executar o instalador) Tj
+0 -14 Td
+(---------------------------------) Tj
+0 -14 Td
+(- Envie o arquivo 'imersao-installer.sh' para a VPS e execute como root:) Tj
+0 -14 Td
+(  bash imersao-installer.sh) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(3\) O que o instalador faz) Tj
+0 -14 Td
+(-------------------------) Tj
+0 -14 Td
+(- Cria /opt/imersao com pastas de cada serviço.) Tj
+0 -14 Td
+(- Gera o arquivo .env com seus domínios e segredos.) Tj
+0 -14 Td
+(- Escreve um docker-compose.yml completo com healthchecks.) Tj
+0 -14 Td
+(- Sobe Traefik, Portainer, Postgres, Redis, n8n \(UI + webhook + worker\) e Evolution API.) Tj
+0 -14 Td
+(- Executa '/opt/imersao/tools/healthcheck.sh' mostrando erros e comandos de correção.) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(4\) Variáveis importantes) Tj
+0 -14 Td
+(------------------------) Tj
+0 -14 Td
+(- ACME_EMAIL: email para emissão de certificados \(Let's Encrypt\).) Tj
+0 -14 Td
+(- TRAEFIK_HOST, PORTAINER_HOST, N8N_HOST, N8N_WEBHOOK_HOST, EVO_HOST: subdomínios HTTPS.) Tj
+0 -14 Td
+(- POSTGRES_PASSWORD: senha do banco do n8n.) Tj
+0 -14 Td
+(- N8N_ENCRYPTION_KEY: chave para criptografar credenciais do n8n \(salve num local seguro\).) Tj
+0 -14 Td
+(- EVOLUTION_API_KEY: chave para autenticar as requisições HTTP da Evolution API.) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(5\) Acessos esperados) Tj
+0 -14 Td
+(--------------------) Tj
+0 -14 Td
+(- Traefik:   https://traefik.SEUDOMINIO) Tj
+0 -14 Td
+(- Portainer: https://portainer.SEUDOMINIO) Tj
+0 -14 Td
+(- n8n \(UI\):  https://n8n.SEUDOMINIO) Tj
+0 -14 Td
+(- Webhooks:  https://webhook.SEUDOMINIO) Tj
+0 -14 Td
+(- Evolution: https://wa.SEUDOMINIO) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(6\) Verificador de saúde \(healthcheck\)) Tj
+0 -14 Td
+(-------------------------------------) Tj
+0 -14 Td
+(Execute:  bash /opt/imersao/tools/healthcheck.sh) Tj
+0 -14 Td
+(O script testa URLs locais e por domínio e, em caso de falha, imprime dicas:) Tj
+0 -14 Td
+(- Ver logs:        docker logs NOME --tail=100) Tj
+0 -14 Td
+(- Reiniciar:       docker restart NOME) Tj
+0 -14 Td
+(- Recriar serviço: cd /opt/imersao && docker compose up -d --no-deps --force-recreate NOME) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(7\) Pareamento Evolution API) Tj
+0 -14 Td
+(---------------------------) Tj
+ET
+
+endstream
+endobj
+3 0 obj
+<< /Type /Page
+   /Parent 6 0 R
+   /MediaBox [0 0 595 842]
+   /Resources << /Font << /F1 1 0 R >> >>
+   /Contents 2 0 R
+>>
+endobj
+4 0 obj
+<< /Length 1911 >>
+stream
+BT
+/F1 11 Tf
+50 800 Td
+(Crie instância e obtenha QR \(ajuste domínios/chaves\):) Tj
+0 -14 Td
+(curl -X POST "https://wa.SEUDOMINIO/instance/create"   -H "Content-Type: application/json"   -H) Tj
+0 -14 Td
+( "apikey: SUA_CHAVE_API"   -d '{ "instanceName":"imersao01", "token":"token-interno-qualquer",) Tj
+0 -14 Td
+(        "qrcode":true, "number":"55SEUNUMERO",) Tj
+0 -14 Td
+(        "integration":"WHATSAPP-BAILEYS", "alwaysOnline":true, "readMessages":true }') Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(curl -H "apikey: SUA_CHAVE_API" "https://wa.SEUDOMINIO/instance/connect/imersao01") Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(8\) Troubleshooting rápido) Tj
+0 -14 Td
+(-------------------------) Tj
+0 -14 Td
+(- Certificado não emite: confira DNS, libere portas 80/443 e aguarde a primeira visita.) Tj
+0 -14 Td
+(- n8n com URL errada no webhook: revise WEBHOOK_URL no .env e reinicie n8n.) Tj
+0 -14 Td
+(- Fila não processa: confirme Redis ativo e EXECUTIONS_MODE=queue; veja logs de n8n-worker.) Tj
+0 -14 Td
+(- Evolution API sem QR: recrie instância e confira rotas /instance/create e /instance/connect.) Tj
+0 -14 Td
+(- Conflitos: pare/remova containers antigos antes de subir esta stack.) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(9\) Manutenção) Tj
+0 -14 Td
+(-------------) Tj
+0 -14 Td
+(- Atualização:  cd /opt/imersao && docker compose pull && docker compose up -d) Tj
+0 -14 Td
+(- Backup do banco do n8n:) Tj
+0 -14 Td
+(  docker exec -t postgres pg_dump -U $POSTGRES_USER $POSTGRES_DB > ) Tj
+0 -14 Td
+(/opt/imersao/backup_n8n_$\(date +%F\).sql) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(10\) Segurança) Tj
+0 -14 Td
+(-------------) Tj
+0 -14 Td
+(- Use senha forte no Postgres e proteja o dashboard do Traefik com Basic Auth.) Tj
+0 -14 Td
+(- Guarde a N8N_ENCRYPTION_KEY em local seguro \(sem ela, não descriptografa credenciais\).) Tj
+0 -14 Td
+(- Restrinja portas na VPS com UFW: permita 22, 80 e 443.) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(Bom workshop! ?) Tj
+0 -14 Td
+() Tj
+ET
+
+endstream
+endobj
+5 0 obj
+<< /Type /Page
+   /Parent 6 0 R
+   /MediaBox [0 0 595 842]
+   /Resources << /Font << /F1 1 0 R >> >>
+   /Contents 4 0 R
+>>
+endobj
+6 0 obj
+<< /Type /Pages
+   /Kids [ 3 0 R 5 0 R ]
+   /Count 2
+>>
+endobj
+7 0 obj
+<< /Type /Catalog
+   /Pages 6 0 R
+>>
+endobj
+8 0 obj
+<< /Title (Guia ImersÃ£o AutomaÃ§Ã£o & IA)
+   /Producer (ChatGPT minimal PDF)
+   /CreationDate (D:20250820121637Z)
+>>
+endobj
+xref
+0 9
+0000000000 65535 f 
+0000000015 00000 n 
+0000000085 00000 n 
+0000003013 00000 n 
+0000003151 00000 n 
+0000005114 00000 n 
+0000005252 00000 n 
+0000005323 00000 n 
+0000005375 00000 n 
+trailer
+<< /Size 9
+   /Root 7 0 R
+   /Info 8 0 R
+>>
+startxref
+5508
+%%EOF
