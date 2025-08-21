@@ -1,169 +1,176 @@
 #!/usr/bin/env bash
-# Hostinger Quick Installer v3.2 — Evolution + Portainer + Traefik
-# - Sempre pergunta se deseja atualizar variáveis do .env
-# - Detecção da rede do Traefik e uso de traefik.docker.network
-# - Healthcheck com fallback para n8n
-set -euo pipefail
+set -Eeuo pipefail
 
-banner() {
-  printf '%s\n' "============================================================"
-  printf '%s\n' " Hostinger Quick Installer — Evolution + Portainer + Traefik"
-  printf '%s\n\n' "============================================================"
-}
-err() { printf '❌ %s\n' "$*" >&2; }
+TITLE1="INSTALADOR MUTUA.DIGITAL IMERSÃO: AUTOMAÇÃO & IA NA PRÁTICA"
+TITLE2="FERRAMENTAS: Evolution + Portainer + Traefik (v3.4)"
+COMPOSE_DIR="/root"
+BASE_COMPOSE="${COMPOSE_DIR}/docker-compose.yml"
+OVERRIDE_COMPOSE="${COMPOSE_DIR}/docker-compose.override.yml"
+ENV_FILE="${COMPOSE_DIR}/.env"
+HEALTH="${COMPOSE_DIR}/hostinger-healthcheck.sh"
 
-ask() { # ask "Pergunta" "default"  (funciona mesmo via curl|bash)
-  local prompt="$1"; local def="${2:-}"; local ans=""
-  if [ -r /dev/tty ]; then
-    if [ -n "$def" ]; then
-      read -r -p "$prompt [$def]: " ans < /dev/tty || true
-      ans="${ans:-$def}"
-    else
-      read -r -p "$prompt: " ans < /dev/tty || true
-    fi
+echo "============================================================"
+echo " ${TITLE1}"
+echo " ${TITLE2}"
+echo "============================================================"
+echo
+
+cd "${COMPOSE_DIR}"
+
+# ---------------- helpers ----------------
+ask() {
+  local prompt="$1"; local default="${2:-}"
+  if [[ -n "${default}" ]]; then
+    read -r -p "${prompt} [${default}]: " REPLY || true
+    echo "${REPLY:-$default}"
   else
-    ans="$def"
+    read -r -p "${prompt}: " REPLY || true
+    echo "${REPLY}"
   fi
-  printf '%s\n' "$ans"
 }
-yesno() { # yesno "Pergunta" "y|n"
-  local prompt="$1"; local def="${2:-y}"; local ans=""
-  local defShow; defShow="$(printf '%s' "$def" | tr yYnN Yy)"
-  if [ -r /dev/tty ]; then
-    read -r -p "$prompt [$defShow]: " ans < /dev/tty || true
-    ans="${ans:-$def}"
-  else
-    ans="$def"
+
+rand_hex() { openssl rand -hex 16; }
+
+ensure_pkg() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    apt-get update -y && apt-get install -y "$1"
   fi
-  case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in y|yes) return 0;; *) return 1;; esac
 }
 
-find_compose_dir() {
-  if [ -n "${BASE_DIR:-}" ] && [ -f "${BASE_DIR}/docker-compose.yml" ]; then printf '%s\n' "$BASE_DIR"; return 0; fi
-  for d in "$PWD" "/root" "/home/$(whoami)" "/opt" "/srv"; do
-    [ -f "$d/docker-compose.yml" ] && { printf '%s\n' "$d"; return 0; }
-  done; return 1
-}
-ensure_env() { # ensure_env KEY VALUE FILE
-  local key="$1"; local val="$2"; local file="$3"; touch "$file"
-  if grep -qE "^${key}=" "$file"; then sed -i -E "s|^(${key}=).*|\1${val}|" "$file"; else printf '%s=%s\n' "$key" "$val" >> "$file"; fi
-}
-
-health_summary() {
-  echo; echo "=== Endpoints esperados ==="
-  local DOMAIN_NAME SUBDOMAIN EVO_SUBDOMAIN P_HOST T_HOST
-  DOMAIN_NAME="$(grep -E '^DOMAIN_NAME=' "$ENV_FILE" | cut -d= -f2- || true)"
-  SUBDOMAIN="$(grep -E '^SUBDOMAIN=' "$ENV_FILE" | cut -d= -f2- || true)"
-  EVO_SUBDOMAIN="$(grep -E '^EVO_SUBDOMAIN=' "$ENV_FILE" | cut -d= -f2- || true)"
-  P_HOST="$(grep -E '^PORTAINER_HOST=' "$ENV_FILE" | cut -d= -f2- || true)"
-  T_HOST="$(grep -E '^TRAEFIK_HOST=' "$ENV_FILE" | cut -d= -f2- || true)"
-  [ -n "$SUBDOMAIN" ]     && echo " - n8n:       https://${SUBDOMAIN}.${DOMAIN_NAME}"
-  [ -n "$EVO_SUBDOMAIN" ] && echo " - Evolution: https://${EVO_SUBDOMAIN}.${DOMAIN_NAME}"
-  [ -n "$P_HOST" ]        && echo " - Portainer: https://${P_HOST}"
-  [ -n "$T_HOST" ]        && echo " - Traefik:   https://${T_HOST}"
-  echo; echo "Comandos úteis:"
-  echo " - Logs Traefik:      docker logs traefik --tail=200"
-  echo " - Logs n8n:          docker logs n8n --tail=200 || docker logs root-n8n-1 --tail=200"
-  echo " - Logs Evolution:    docker logs evolution-api --tail=200"
-  echo " - Logs Portainer:    docker logs portainer --tail=200"
-  echo " - Recriar serviço:   docker compose up -d --no-deps --force-recreate <servico>"
-  echo; echo "Healthcheck: ./hostinger-healthcheck.sh"
+parse_pg_env_from_compose() {
+  # pega credenciais do serviço postgres do compose base da Hostinger
+  # fallback para valores conhecidos caso parsing falhe
+  local u p d
+  u=$(awk '/postgres:/{flag=1} flag && /POSTGRES_USER:/{print $2; exit}' "${BASE_COMPOSE}" 2>/dev/null || true)
+  p=$(awk '/postgres:/{flag=1} flag && /POSTGRES_PASSWORD:/{print $2; exit}' "${BASE_COMPOSE}" 2>/dev/null || true)
+  d=$(awk '/postgres:/{flag=1} flag && /POSTGRES_DB:/{print $2; exit}' "${BASE_COMPOSE}" 2>/dev/null || true)
+  [[ -z "${u:-}" ]] && u="n8n"
+  [[ -z "${p:-}" ]] && p="n8n"
+  [[ -z "${d:-}" ]] && d="n8ndb"
+  echo "${u};${p};${d}"
 }
 
-### INÍCIO
-banner
-command -v docker >/dev/null 2>&1 || { err "Docker não encontrado."; exit 1; }
-docker compose version >/dev/null 2>&1 || { err "Docker Compose plugin não encontrado (docker compose)."; exit 1; }
+# --------------- .env wizard ---------------
+touch "${ENV_FILE}" 2>/dev/null || true
 
-COMPOSE_DIR="${BASE_DIR:-}"; [ -z "$COMPOSE_DIR" ] && COMPOSE_DIR="$(find_compose_dir)" || true
-[ -n "$COMPOSE_DIR" ] || { err "Não encontrei docker-compose.yml. Defina BASE_DIR ou rode na pasta correta."; exit 1; }
-cd "$COMPOSE_DIR"; echo "📁 Diretório do compose: $COMPOSE_DIR"; echo
+# carrega defaults existentes
+source "${ENV_FILE}" 2>/dev/null || true
+DOMAIN_NAME_DEFAULT="${DOMAIN_NAME:-imautomaia.com.br}"
+SUBDOMAIN_DEFAULT="${SUBDOMAIN:-n8n}"
+TZ_DEFAULT="${GENERIC_TIMEZONE:-America/Sao_Paulo}"
+SSL_EMAIL_DEFAULT="${SSL_EMAIL:-you@example.com}"
+EVO_SUB_DEFAULT="${EVO_SUBDOMAIN:-wa}"
+PORTAINER_HOST_DEFAULT="${PORTAINER_HOST:-portainer.${DOMAIN_NAME_DEFAULT}}"
+TRAEFIK_HOST_DEFAULT="${TRAEFIK_HOST:-traefik.${DOMAIN_NAME_DEFAULT}}"
+ACME_CHALLENGE_DEFAULT="${ACME_CHALLENGE:-tls}" # tls|http
+EVOKEY_DEFAULT="${EVOLUTION_API_KEY:-}"
 
-ENV_FILE="$COMPOSE_DIR/.env"; touch "$ENV_FILE"
-# valores atuais
-CUR_DOMAIN="$(grep -E '^DOMAIN_NAME=' "$ENV_FILE" | cut -d= -f2- || true)"
-CUR_SUB="$(grep -E '^SUBDOMAIN=' "$ENV_FILE" | cut -d= -f2- || true)"
-CUR_TZ="$(grep -E '^GENERIC_TIMEZONE=' "$ENV_FILE" | cut -d= -f2- || true)"
-CUR_SSL_EMAIL="$(grep -E '^SSL_EMAIL=' "$ENV_FILE" | cut -d= -f2- || true)"
-CUR_EVO_SUB="$(grep -E '^EVO_SUBDOMAIN=' "$ENV_FILE" | cut -d= -f2- || true)"
-CUR_EVO_KEY="$(grep -E '^EVOLUTION_API_KEY=' "$ENV_FILE" | cut -d= -f2- || true)"
-CUR_P_HOST="$(grep -E '^PORTAINER_HOST=' "$ENV_FILE" | cut -d= -f2- || true)"
-CUR_T_HOST="$(grep -E '^TRAEFIK_HOST=' "$ENV_FILE" | cut -d= -f2- || true)"
-CUR_TNET="$(grep -E '^TRAEFIK_NETWORK=' "$ENV_FILE" | cut -d= -f2- || true)"
-
-# pergunta se quer atualizar
 echo "== Configuração dos domínios e chaves =="
-if yesno "Deseja revisar/atualizar as variáveis do .env?" "y"; then
-  DOMAIN_NAME="$(ask 'Domínio raiz (ex.: imautomaia.com.br)' "${CUR_DOMAIN:-}")"
-  SUBDOMAIN="$(ask 'Subdomínio do n8n (ex.: n8n)' "${CUR_SUB:-n8n}")"
-  GENERIC_TIMEZONE="$(ask 'Timezone (ex.: America/Sao_Paulo)' "${CUR_TZ:-America/Sao_Paulo}")"
-  SSL_EMAIL="$(ask 'Email para certificados (Let’s Encrypt)' "${CUR_SSL_EMAIL:-}")"
-  EVO_SUBDOMAIN="$(ask 'Subdomínio da Evolution (ex.: wa)' "${CUR_EVO_SUB:-wa}")"
+if [[ "$(ask 'Deseja revisar/atualizar as variáveis do .env? (Y/n)' 'Y')" =~ ^(Y|y)$ ]]; then
+  DOMAIN_NAME="$(ask 'Domínio raiz (ex.: imautomaia.com.br)' "${DOMAIN_NAME_DEFAULT}")"
+  SUBDOMAIN="$(ask 'Subdomínio do n8n (ex.: n8n)' "${SUBDOMAIN_DEFAULT}")"
+  GENERIC_TIMEZONE="$(ask 'Timezone (ex.: America/Sao_Paulo)' "${TZ_DEFAULT}")"
+  SSL_EMAIL="$(ask 'Email para certificados (Let’s Encrypt)' "${SSL_EMAIL_DEFAULT}")"
+  EVO_SUBDOMAIN="$(ask 'Subdomínio da Evolution (ex.: wa)' "${EVO_SUB_DEFAULT}")"
 
-  if yesno "Expor Portainer por domínio? (portainer.${DOMAIN_NAME})" "$( [ -n "${CUR_P_HOST:-}" ] && echo y || echo n )"; then
-    PORTAINER_HOST="$(ask 'Host do Portainer' "${CUR_P_HOST:-portainer.${DOMAIN_NAME}}")"
+  if [[ "$(ask 'Expor Portainer por domínio? (portainer.DOM)' 'Y')" =~ ^(Y|y)$ ]]; then
+    PORTAINER_HOST="$(ask 'Host do Portainer' "${PORTAINER_HOST_DEFAULT}")"
   else
     PORTAINER_HOST=""
   fi
 
-  if yesno "Expor Traefik dashboard por domínio? (traefik.${DOMAIN_NAME})" "$( [ -n "${CUR_T_HOST:-}" ] && echo y || echo n )"; then
-    TRAEFIK_HOST="$(ask 'Host do Traefik' "${CUR_T_HOST:-traefik.${DOMAIN_NAME}}")"
+  if [[ "$(ask 'Expor Traefik dashboard por domínio? (traefik.DOM)' 'Y')" =~ ^(Y|y)$ ]]; then
+    TRAEFIK_HOST="$(ask 'Host do Traefik' "${TRAEFIK_HOST_DEFAULT}")"
   else
     TRAEFIK_HOST=""
   fi
+
+  ACME_CHALLENGE="$(ask 'Tipo de desafio ACME (tls|http) — use http se Cloudflare Proxied' "${ACME_CHALLENGE_DEFAULT}")"
+
+  if [[ -z "${EVOKEY_DEFAULT}" ]]; then
+    EVOLUTION_API_KEY="$(rand_hex)"
+    echo "Gerada EVOLUTION_API_KEY (oculta)."
+  else
+    EVOLUTION_API_KEY="${EVOKEY_DEFAULT}"
+    if [[ "$(ask 'Deseja rotacionar a EVOLUTION_API_KEY?' 'n')" =~ ^(Y|y)$ ]]; then
+      EVOLUTION_API_KEY="$(rand_hex)"
+      echo "Rotacionada EVOLUTION_API_KEY (oculta)."
+    fi
+  fi
+
+  cat > "${ENV_FILE}" <<EOF
+DOMAIN_NAME=${DOMAIN_NAME}
+SUBDOMAIN=${SUBDOMAIN}
+GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
+SSL_EMAIL=${SSL_EMAIL}
+EVO_SUBDOMAIN=${EVO_SUBDOMAIN}
+PORTAINER_HOST=${PORTAINER_HOST}
+TRAEFIK_HOST=${TRAEFIK_HOST}
+ACME_CHALLENGE=${ACME_CHALLENGE}
+EVOLUTION_API_KEY=${EVOLUTION_API_KEY}
+EOF
+  echo "✅ .env atualizado em: ${ENV_FILE}"
 else
-  # mantém os atuais
-  DOMAIN_NAME="${CUR_DOMAIN:-}"; SUBDOMAIN="${CUR_SUB:-n8n}"
-  GENERIC_TIMEZONE="${CUR_TZ:-America/Sao_Paulo}"; SSL_EMAIL="${CUR_SSL_EMAIL:-}"
-  EVO_SUBDOMAIN="${CUR_EVO_SUB:-wa}"; PORTAINER_HOST="${CUR_P_HOST:-}"; TRAEFIK_HOST="${CUR_T_HOST:-}"
+  echo "Usando valores existentes em ${ENV_FILE}"
 fi
+source "${ENV_FILE}"
 
-# Evolution API key
-if [ -z "${CUR_EVO_KEY:-}" ]; then
-  if command -v openssl >/dev/null 2>&1; then EVOLUTION_API_KEY="$(openssl rand -hex 16)"; else EVOLUTION_API_KEY="change-me-$(date +%s)"; fi
-else EVOLUTION_API_KEY="${CUR_EVO_KEY}"; fi
-
-# detectar rede do traefik
-if [ -z "${CUR_TNET:-}" ]; then
-  TRAEFIK_NETWORK="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{printf "%s " $k}}{{end}}' root-traefik-1 2>/dev/null | awk '{print $1}')"
-else
-  TRAEFIK_NETWORK="$CUR_TNET"
-fi
-
-# persistir
-ensure_env "DOMAIN_NAME" "$DOMAIN_NAME" "$ENV_FILE"
-ensure_env "SUBDOMAIN" "$SUBDOMAIN" "$ENV_FILE"
-ensure_env "GENERIC_TIMEZONE" "$GENERIC_TIMEZONE" "$ENV_FILE"
-ensure_env "SSL_EMAIL" "$SSL_EMAIL" "$ENV_FILE"
-ensure_env "EVO_SUBDOMAIN" "$EVO_SUBDOMAIN" "$ENV_FILE"
-ensure_env "EVOLUTION_API_KEY" "$EVOLUTION_API_KEY" "$ENV_FILE"
-[ -n "$PORTAINER_HOST" ] && ensure_env "PORTAINER_HOST" "$PORTAINER_HOST" "$ENV_FILE" || sed -i '/^PORTAINER_HOST=/d' "$ENV_FILE" || true
-[ -n "$TRAEFIK_HOST" ]   && ensure_env "TRAEFIK_HOST" "$TRAEFIK_HOST" "$ENV_FILE"   || sed -i '/^TRAEFIK_HOST=/d' "$ENV_FILE" || true
-[ -n "$TRAEFIK_NETWORK" ]&& ensure_env "TRAEFIK_NETWORK" "$TRAEFIK_NETWORK" "$ENV_FILE"
-
-echo "✅ .env atualizado em: $ENV_FILE"
-echo; echo "Resumo .env (chave oculta):"
-grep -E '^(DOMAIN_NAME|SUBDOMAIN|GENERIC_TIMEZONE|SSL_EMAIL|EVO_SUBDOMAIN|PORTAINER_HOST|TRAEFIK_HOST|TRAEFIK_NETWORK)=' "$ENV_FILE" || true
-grep -E '^(EVOLUTION_API_KEY)=' "$ENV_FILE" | sed -E 's/(EVOLUTION_API_KEY=).+/\1***oculto***/' || true
+echo
+echo "Resumo .env (chave oculta):"
+echo "DOMAIN_NAME=${DOMAIN_NAME}"
+echo "SUBDOMAIN=${SUBDOMAIN}"
+echo "GENERIC_TIMEZONE=${GENERIC_TIMEZONE}"
+echo "SSL_EMAIL=${SSL_EMAIL}"
+echo "EVO_SUBDOMAIN=${EVO_SUBDOMAIN}"
+echo "PORTAINER_HOST=${PORTAINER_HOST:-<não exposto>}"
+echo "TRAEFIK_HOST=${TRAEFIK_HOST:-<não exposto>}"
+echo "ACME_CHALLENGE=${ACME_CHALLENGE}"
+echo "EVOLUTION_API_KEY=***oculto***"
 echo
 
-# override
-OVERRIDE_FILE="$COMPOSE_DIR/docker-compose.override.yml"
-[ -f "$OVERRIDE_FILE" ] && cp -f "$OVERRIDE_FILE" "$OVERRIDE_FILE.bak.$(date +%s)" && echo "ℹ️  Backup: $OVERRIDE_FILE.bak.$(date +%s)"
+# --------------- compose override ---------------
+# Seleciona flags do Traefik para ACME
+ACME_FLAGS=""
+if [[ "${ACME_CHALLENGE}" == "http" ]]; then
+  ACME_FLAGS=$(cat <<ACME
+      - "--certificatesresolvers.mytlschallenge.acme.httpchallenge=true"
+      - "--certificatesresolvers.mytlschallenge.acme.httpchallenge.entrypoint=web"
+ACME
+)
+else
+  ACME_FLAGS='      - "--certificatesresolvers.mytlschallenge.acme.tlschallenge=true"'
+fi
 
-cat > "$OVERRIDE_FILE" <<YAML
-version: "3.7"
+# Monta CONNECTION_URI do Postgres a partir do compose base
+IFS=';' read -r PGUSER PGPASS PGDB <<<"$(parse_pg_env_from_compose)"
+PG_URI="postgresql://${PGUSER}:${PGPASS}@postgres:5432/evolution?schema=public"
 
+backup="${OVERRIDE_COMPOSE}.bak.$(date +%s)"
+cp -f "${OVERRIDE_COMPOSE}" "${backup}" 2>/dev/null || true
+echo "ℹ️  Backup: ${backup}"
+
+# IMPORTANTE: remover 'version:' pra evitar warning do compose v2
+cat > "${OVERRIDE_COMPOSE}" <<YAML
 services:
+  # ----- Evolution API -----
   evolution:
     image: atendai/evolution-api:latest
     container_name: evolution-api
     restart: always
     environment:
       AUTHENTICATION_API_KEY: \${EVOLUTION_API_KEY}
+      # Persistência e cache (v2)
+      DATABASE_ENABLED: "true"
+      DATABASE_PROVIDER: "postgresql"
+      DATABASE_CONNECTION_URI: "${PG_URI}"
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: "redis://redis:6379/6"
+      CACHE_REDIS_PREFIX_KEY: "evolution"
+      CACHE_LOCAL_ENABLED: "false"
     volumes:
       - evolution_store:/evolution/store
       - evolution_instances:/evolution/instances
+    networks: [ web ]
     labels:
       - traefik.enable=true
       - traefik.http.routers.evolution.rule=Host(\`\${EVO_SUBDOMAIN}.\${DOMAIN_NAME}\`)
@@ -171,8 +178,9 @@ services:
       - traefik.http.routers.evolution.tls=true
       - traefik.http.routers.evolution.tls.certresolver=mytlschallenge
       - traefik.http.services.evolution.loadbalancer.server.port=8080
-      - traefik.docker.network=\${TRAEFIK_NETWORK}
+      - traefik.docker.network=web
 
+  # ----- Portainer -----
   portainer:
     image: portainer/portainer-ce:latest
     container_name: portainer
@@ -180,118 +188,157 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - portainer_data:/data
+    networks: [ web ]
     labels:
-YAML
-
-# labels condicionais
-if [ -n "${PORTAINER_HOST:-}" ]; then
-  cat >> "$OVERRIDE_FILE" <<YAML
+$( [[ -n "${PORTAINER_HOST}" ]] && cat <<'LBL'
       - traefik.enable=true
-      - traefik.http.routers.portainer.rule=Host(\`\${PORTAINER_HOST}\`)
+      - traefik.http.routers.portainer.rule=Host(`${PORTAINER_HOST}`)
       - traefik.http.routers.portainer.entrypoints=web,websecure
       - traefik.http.routers.portainer.tls=true
       - traefik.http.routers.portainer.tls.certresolver=mytlschallenge
       - traefik.http.services.portainer.loadbalancer.server.port=9000
-      - traefik.docker.network=\${TRAEFIK_NETWORK}
-YAML
-else
-  echo "      # Portainer não exposto por domínio" >> "$OVERRIDE_FILE"
-fi
+      - traefik.docker.network=web
+LBL
+)
 
-cat >> "$OVERRIDE_FILE" <<YAML
-
+  # ----- Traefik: complementa serviço existente -----
   traefik:
+    networks: [ web ]
     labels:
-YAML
-
-if [ -n "${TRAEFIK_HOST:-}" ]; then
-  cat >> "$OVERRIDE_FILE" <<YAML
+$( [[ -n "${TRAEFIK_HOST}" ]] && cat <<'LBL'
       - traefik.enable=true
-      - traefik.http.routers.traefik.rule=Host(\`\${TRAEFIK_HOST}\`)
-      - traefik.http.routers.traefik.entrypoints=web,websecure
-      - traefik.http.routers.traefik.tls=true
-      - traefik.http.routers.traefik.tls.certresolver=mytlschallenge
-      - traefik.http.routers.traefik.service=api@internal
-      - traefik.docker.network=\${TRAEFIK_NETWORK}
-YAML
-else
-  echo "      # Traefik dashboard não exposto por domínio" >> "$OVERRIDE_FILE"
-fi
-
-cat >> "$OVERRIDE_FILE" <<'YAML'
+      - traefik.http.routers.traefik.rule=Host(`${TRAEFIK_HOST}`)
+LBL
+)
+    command:
+      - "--api=true"
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.mytlschallenge.acme.email=\${SSL_EMAIL}"
+      - "--certificatesresolvers.mytlschallenge.acme.storage=/letsencrypt/acme.json"
+${ACME_FLAGS}
 
 volumes:
   evolution_store:
   evolution_instances:
   portainer_data:
+  # traefik_data/n8n_data já são externos no compose base da Hostinger
+
+networks:
+  web:
+    driver: bridge
 YAML
 
 echo "✅ docker-compose.override.yml atualizado."
 echo
 
+# --------------- redes & serviços ---------------
+# cria rede web caso não exista
+docker network inspect web >/dev/null 2>&1 || docker network create web
+
 echo "Baixando/atualizando imagens necessárias..."
-docker compose pull evolution portainer || true
+docker compose pull --ignore-buildable
 
-echo "Subindo/atualizando serviços..."
+echo "Subindo serviços na ordem (traefik → portainer → postgres → redis → evolution)..."
+docker compose up -d traefik portainer
+docker compose up -d postgres redis
 docker compose up -d evolution
-[ -n "${PORTAINER_HOST:-}" ] && docker compose up -d portainer || true
-docker compose up -d traefik || true
 
-echo; echo "Gerando healthcheck..."
-HEALTH_FILE="$COMPOSE_DIR/hostinger-healthcheck.sh"
-cat > "$HEALTH_FILE" <<'EOS'
+# garante DB 'evolution'
+echo "Garantindo base 'evolution' no Postgres..."
+ensure_pkg jq >/dev/null
+PGP=$(docker compose exec -T postgres env | grep -E '^POSTGRES_PASSWORD=' | cut -d= -f2 || true)
+[[ -z "${PGP}" ]] && PGP="${PGPASS}"
+PGU=$(docker compose exec -T postgres env | grep -E '^POSTGRES_USER=' | cut -d= -f2 || true)
+[[ -z "${PGU}" ]] && PGU="${PGUSER}"
+docker compose exec -T -e PGPASSWORD="${PGP}" postgres \
+  psql -U "${PGU}" -d postgres -c "CREATE DATABASE evolution;" 2>/dev/null || true
+
+# --------------- healthcheck script ---------------
+cat > "${HEALTH}" <<'HSH'
 #!/usr/bin/env bash
-set -euo pipefail
-BASE_DIR="${BASE_DIR:-$PWD}"
-ENV_FILE="$BASE_DIR/.env"
-[ -f "$ENV_FILE" ] || { echo "❌ .env não encontrado em $BASE_DIR"; exit 1; }
-
-DOMAIN_NAME="$(grep -E '^DOMAIN_NAME=' "$ENV_FILE" | cut -d= -f2-)"
-SUBDOMAIN="$(grep -E '^SUBDOMAIN=' "$ENV_FILE" | cut -d= -f2-)"
-EVO_SUBDOMAIN="$(grep -E '^EVO_SUBDOMAIN=' "$ENV_FILE" | cut -d= -f2- )"
-PORTAINER_HOST="$(grep -E '^PORTAINER_HOST=' "$ENV_FILE" | cut -d= -f2- | tr -d '\n' || true)"
-TRAEFIK_HOST="$(grep -E '^TRAEFIK_HOST=' "$ENV_FILE" | cut -d= -f2- | tr -d '\n' || true)"
+set -Eeuo pipefail
+source /root/.env 2>/dev/null || true
+N8N="https://${SUBDOMAIN}.${DOMAIN_NAME}/rest/healthz"
+EVO="https://${EVO_SUBDOMAIN}.${DOMAIN_NAME}/instance/fetchInstances"
+PRT="https://${PORTAINER_HOST}"
+TRF="https://${TRAEFIK_HOST}"
 
 echo "=== Healthcheck Hostinger Stack ==="
-[ -n "$SUBDOMAIN" ]     && echo "n8n:       https://${SUBDOMAIN}.${DOMAIN_NAME}/rest/healthz"
-[ -n "$EVO_SUBDOMAIN" ] && echo "evolution: https://${EVO_SUBDOMAIN}.${DOMAIN_NAME}/"
-[ -n "$PORTAINER_HOST" ]&& echo "portainer: https://${PORTAINER_HOST}"
-[ -n "$TRAEFIK_HOST" ]  && echo "traefik:   https://${TRAEFIK_HOST}"
+echo "n8n:       ${N8N}"
+echo "evolution: ${EVO}"
+echo "portainer: ${PRT}"
+echo "traefik:   ${TRF}"
 echo
 
-check() {
-  local name="$1"; local url="$2"
-  if curl -sSf -m 8 "$url" >/dev/null; then
-    echo "✅ $name OK → $url"
-  else
-    echo "❌ $name FAIL → $url"
-    echo "   Logs: docker logs $name --tail=200 || true"
-    echo "   Restart: docker restart $name || true"
-    echo "   Recreate: docker compose up -d --no-deps --force-recreate $name || true"
-    echo
-  fi
-}
-
-if curl -sSf -m 5 http://localhost:80 >/dev/null ; then
+# porta 80 (traefik)
+if curl -fsS "http://${DOMAIN_NAME}" >/dev/null 2>&1; then
   echo "✅ Traefik (porta 80) OK"
 else
-  echo "❌ Traefik (porta 80) FAIL"
-  echo "   docker logs traefik --tail=200"
+  echo "❌ Traefik porta 80 FAIL"
+  docker logs traefik --tail=200 || docker logs root-traefik-1 --tail=200 || true
 fi
 
-# n8n: tenta alguns caminhos
-if ! check "n8n" "https://${SUBDOMAIN}.${DOMAIN_NAME}/rest/healthz"; then
-  curl -sSf -m 8 "https://${SUBDOMAIN}.${DOMAIN_NAME}/healthz" >/dev/null 2>&1 && echo "✅ n8n OK em /healthz" || true
+# n8n
+if curl -fsS "${N8N}" >/dev/null 2>&1; then
+  echo "✅ n8n OK → ${N8N}"
+else
+  echo "❌ n8n FAIL → ${N8N}"
+  echo "   Logs: docker logs n8n --tail=200 || docker logs root-n8n-1 --tail=200"
+  echo "   Restart: docker restart n8n"
+  echo "   Recreate: docker compose up -d --no-deps --force-recreate n8n"
 fi
 
-[ -n "$EVO_SUBDOMAIN" ] && check "evolution-api" "https://${EVO_SUBDOMAIN}.${DOMAIN_NAME}/"
-[ -n "$PORTAINER_HOST" ]&& check "portainer" "https://${PORTAINER_HOST}"
-[ -n "$TRAEFIK_HOST" ]  && check "traefik" "https://${TRAEFIK_HOST}"
+# evolution (usa apikey)
+if curl -fsS "${EVO}" -H "apikey: ${EVOLUTION_API_KEY}" >/dev/null 2>&1; then
+  echo "✅ evolution-api OK → ${EVO}"
+else
+  echo "❌ evolution-api FAIL → ${EVO}"
+  echo "   Logs: docker logs evolution-api --tail=200"
+  echo "   Restart: docker restart evolution-api"
+  echo "   Recreate: docker compose up -d --no-deps --force-recreate evolution"
+fi
+
+# portainer
+if [[ -n "${PORTAINER_HOST}" ]] && curl -fsS "${PRT}" >/dev/null 2>&1; then
+  echo "✅ portainer OK → ${PRT}"
+elif [[ -n "${PORTAINER_HOST}" ]]; then
+  echo "❌ portainer FAIL → ${PRT}"
+  echo "   Logs: docker logs portainer --tail=200"
+fi
+
+# traefik dash
+if [[ -n "${TRAEFIK_HOST}" ]] && curl -fsS "${TRF}" >/dev/null 2>&1; then
+  echo "✅ traefik OK → ${TRF}"
+elif [[ -n "${TRAEFIK_HOST}" ]]; then
+  echo "❌ traefik FAIL → ${TRF}"
+  echo "   Logs: docker logs traefik --tail=200 || docker logs root-traefik-1 --tail=200"
+fi
+
 echo "=== Done ==="
-EOS
-chmod +x "$HEALTH_FILE"
-echo "✅ Healthcheck criado: $HEALTH_FILE"
-
-echo; echo "Aguardando emissão de certificados (1–2 min após a primeira visita aos hosts)..."
-health_summary
+HSH
+chmod +x "${HEALTH}"
+echo "✅ Healthcheck criado: ${HEALTH}"
+echo
+echo "Aguardando emissão de certificados (visite cada domínio em HTTPS para disparar o ACME)…"
+echo
+echo "=== Endpoints esperados ==="
+echo " - n8n:       https://${SUBDOMAIN}.${DOMAIN_NAME}"
+echo " - Evolution: https://${EVO_SUBDOMAIN}.${DOMAIN_NAME}"
+[[ -n "${PORTAINER_HOST}" ]] && echo " - Portainer: https://${PORTAINER_HOST}"
+[[ -n "${TRAEFIK_HOST}"  ]] && echo " - Traefik:   https://${TRAEFIK_HOST}"
+echo
+echo "Comandos úteis:"
+echo " - Logs Traefik:      docker logs traefik --tail=200 || docker logs root-traefik-1 --tail=200"
+echo " - Logs n8n:          docker logs n8n --tail=200 || docker logs root-n8n-1 --tail=200"
+echo " - Logs Evolution:    docker logs evolution-api --tail=200"
+echo " - Logs Portainer:    docker logs portainer --tail=200"
+echo " - Recriar serviço:   docker compose up -d --no-deps --force-recreate <servico>"
+echo
+echo "Healthcheck: ${HEALTH}"
 echo "Concluído. 🚀"
