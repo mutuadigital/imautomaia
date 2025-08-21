@@ -1,29 +1,20 @@
-# Guia Rápido — Imersão Automação & IA
+# Hostinger Stack: Traefik + n8n + Evolution API + Redis + Postgres + Portainer
 
-**Data de geração:** 2025-08-20
+Stack pronta para produção com **TLS automático (Let's Encrypt)** via **Traefik**, **n8n** com filas, **Evolution API** (WhatsApp) usando imagem estável `evoapicloud/evolution-api`, **Redis**, **Postgres** e **Portainer**.
 
-Este kit sobe **Traefik, Portainer, Postgres, Redis, n8n (queue mode) e Evolution API** com um único script.
+## Pré-requisitos
 
-## Uso (como root)
+- Ubuntu 22.04+ com Docker e Docker Compose plugin instalados
+- DNS A dos hosts apontando para o IP do servidor:
+  - `n8n.<domínio>`
+  - `wa.<domínio>`
+  - `portainer.<domínio>`
+  - `traefik.<domínio>`
+- **Cloudflare proxy desativado (modo “DNS only”)** nas 4 entradas
+
+## Instalação
+
 ```bash
-# copie o arquivo e execute
-bash imersao-installer.sh
-```
-Siga as perguntas interativas para preencher domínios e segredos. O script gera `/.env`, `docker-compose.yml`, e um verificador em `/opt/imersao/tools/healthcheck.sh`.
-
-## Verificação
-```bash
-bash /opt/imersao/tools/healthcheck.sh
-```
-
-## Endpoints esperados
-- Traefik:   `https://traefik.SEUDOMINIO`
-- Portainer: `https://portainer.SEUDOMINIO`
-- n8n:       `https://n8n.SEUDOMINIO`
-- Webhooks:  `https://webhook.SEUDOMINIO`
-- Evolution: `https://wa.SEUDOMINIO`
-
-## Dicas
-- Atualizar imagens: `cd /opt/imersao && docker compose pull && docker compose up -d`
-- Logs: `docker logs NOME --tail=200`
-- Backup Postgres: `docker exec -t postgres pg_dump -U ${POSTGRES_USER} ${POSTGRES_DB} > /opt/imersao/backup_n8n_$(date +%F).sql`
+git clone <repo> && cd <repo>
+chmod +x install.sh
+./install.sh
