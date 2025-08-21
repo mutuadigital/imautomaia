@@ -306,6 +306,68 @@ docker compose up -d n8n n8n-worker portainer
 echo "== Subindo Evolution =="
 docker compose up -d evolution
 
+# === instala healthcheck (atalho no PATH + cópia no repo) ===
+HC=/usr/local/bin/stack-health
+cat > "$HC" <<'BASH'
+#!/usr/bin/env bash
+set -o pipefail
+
+# carregando .env (procura no cwd e em /root)
+ENV_FILE=""
+for f in "./.env" "/root/.env"; do
+  [[ -f "$f" ]] && ENV_FILE="$f" && break
+done
+[[ -n "$ENV_FILE" ]] && source "$ENV_FILE"
+
+DOMAIN="${DOMAIN_NAME:-example.com}"
+N8N_HOST="${SUBDOMAIN}.${DOMAIN}"
+EVO_HOST="${EVO_SUBDOMAIN}.${DOMAIN}"
+PORTAINER_FQDN="${PORTAINER_HOST:-portainer.${DOMAIN}}"
+TRAEFIK_FQDN="${TRAEFIK_HOST:-traefik.${DOMAIN}}"
+KEY="${EVOLUTION_API_KEY:-}"
+
+ok()   { printf "✅ %s\n" "$*"; }
+fail() { printf "❌ %s\n" "$*"; }
+
+echo "=== Healthcheck Stack ==="
+echo "n8n:       https://${N8N_HOST}/rest/healthz"
+echo "evolution: https://${EVO_HOST}/instance/fetchInstances"
+echo "portainer: https://${PORTAINER_FQDN}"
+echo "traefik:   https://${TRAEFIK_FQDN}"
+echo
+
+echo "--- Docker containers ---"
+docker ps --format ' - {{.Names}}: {{.Status}}' \
+ | egrep 'traefik|postgres|redis|n8n|evolution|portainer' || true
+echo
+
+code() { curl -sk -o /dev/null -w '%{http_code}' "$1"; }
+
+c=$(code "https://${TRAEFIK_FQDN}") ; [[ "$c" =~ ^(200|301|302|401|403|404)$ ]] && ok "traefik https (${c})" || fail "traefik https (${c})"
+c=$(code "https://${PORTAINER_FQDN}") ; [[ "$c" =~ ^(200|301|302|401|403)$ ]] && ok "portainer https (${c})" || fail "portainer https (${c})"
+c=$(code "https://${N8N_HOST}/rest/healthz") ; [[ "$c" == "200" ]] && ok "n8n health (${c})" || fail "n8n health (${c})"
+
+if [[ -n "$KEY" ]]; then
+  c=$(curl -sk -H "apikey: $KEY" -o /dev/null -w '%{http_code}' "https://${EVO_HOST}/instance/fetchInstances")
+  [[ "$c" == "200" ]] && ok "evolution list (${c})" || fail "evolution list (${c})"
+else
+  echo "ℹ️  EVOLUTION_API_KEY não encontrado no .env; pulando list."
+fi
+
+echo
+echo "--- Cert (wa) ---"
+openssl s_client -servername "${EVO_HOST}" -connect "${EVO_HOST}:443" </dev/null 2>/dev/null \
+ | openssl x509 -noout -issuer -subject -dates | sed -n '1,3p' || true
+
+echo
+echo "=== Done ==="
+BASH
+chmod +x "$HC"
+# cópia local para o diretório do projeto
+cp "$HC" ./hostinger-healthcheck.sh 2>/dev/null || true
+echo "✅ Healthcheck instalado: use 'stack-health' (ou ./hostinger-healthcheck.sh)"
+
+
 # === prints úteis ===
 echo
 echo "🎉 Concluído!"
