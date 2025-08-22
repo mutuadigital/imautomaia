@@ -210,6 +210,27 @@ echo "✅ Migrations concluídas"
 # Sobe serviços (sem afetar o stack principal)
 docker compose -f "$DC" up -d chatwoot chatwoot-worker
 
+# === Instalação do healthcheck (chat-check) ===
+set -e
+HC_URL="https://raw.githubusercontent.com/mutuadigital/imautomaia/refs/heads/main/chatwoot-healthcheck.sh"
+INSTALL_DIR="/opt/chatwoot"
+BIN="/usr/local/bin/chat-check"
+
+mkdir -p "$INSTALL_DIR"
+curl -fsSL "$HC_URL" -o "$INSTALL_DIR/chatwoot-healthcheck.sh"
+chmod +x "$INSTALL_DIR/chatwoot-healthcheck.sh"
+
+# Wrapper simples no PATH do sistema
+cat > "$BIN" <<'EOF'
+#!/usr/bin/env bash
+# Wrapper para rodar o healthcheck de qualquer lugar
+# Usa /root/.env.chatwoot se existir; caso não, o script se vira sozinho.
+ENV_CW="/root/.env.chatwoot" exec /opt/chatwoot/chatwoot-healthcheck.sh "$@"
+EOF
+chmod +x "$BIN"
+
+echo
+echo "✔ Healthcheck instalado. Use:  chat-check"
 echo
 echo "=== URLs ==="
 echo "Chatwoot: https://${CHATWOOT_HOST}"
