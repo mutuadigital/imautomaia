@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -euo pipefail
 
-# =========[ Chatwoot Add-on Installer ]=========
-# - Não altera seu stack principal (Traefik/Redis/Postgres/n8n)
-# - Usa Postgres/Redis existentes
-# - Cria artefatos em /root/chatwoot
-# - Funciona mesmo via: bash <(curl -fsSL URL)
-# ===============================================
+# --------------------------------------------
+# Chatwoot Add-on Installer (Traefik + Docker)
+# - Não altera seus serviços existentes
+# - Usa Postgres/Redis já existentes
+# - Gera docker-compose.chatwoot.yml separado
+# - Instala "chat-check"
+# --------------------------------------------
 
-trap 'echo "❌ Erro na linha $LINENO"; exit 1' ERR
+# === Config in one place ===
+WORKDIR="/root/chatwoot"
+HC_URL="https://raw.githubusercontent.com/mutuadigital/imautomaia/refs/heads/main/chatwoot-healthcheck.sh"
+WRAPPER_BIN="/usr/local/bin/chat-check"
+CHATWOOT_IMAGE_TAG="${CHATWOOT_IMAGE_TAG:-latest-ce}"   # Ex.: v4.1.0, v3.15.2-ce, latest-ce
 
-# Diretório persistente para arquivos do Chatwoot
-CHAT_DIR="${CHAT_DIR:-/root/chatwoot}"
-mkdir -p "$CHAT_DIR"
-cd "$CHAT_DIR"
+mkdir -p "$WORKDIR"
+cd "$WORKDIR"
 
-ENV_MAIN=""
-for f in "/root/.env" "./.env"; do [[ -f "$f" ]] && ENV_MAIN="$f" && break; done
-[[ -n "$ENV_MAIN" ]] && source "$ENV_MAIN" || true
+# Carrega .env principal se existir (p/ defaults)
+for f in "/root/.env" "./.env"; do
+  [[ -f "$f" ]] && source "$f"
+done
 
 # Defaults
 DOMAIN_NAME_DEFAULT="${DOMAIN_NAME:-srv.example.tld}"
@@ -43,10 +47,10 @@ TZ="${TZ:-$TZ_DEFAULT}"
 
 echo
 echo "=== Banco de Dados (reutilizando Postgres existente) ==="
-read -rp "Postgres HOST [${PG_HOST_DEFAULT}]: " PG_HOST;  PG_HOST="${PG_HOST:-$PG_HOST_DEFAULT}"
-read -rp "Postgres PORT [${PG_PORT_DEFAULT}]: " PG_PORT;  PG_PORT="${PG_PORT:-$PG_PORT_DEFAULT}"
-read -rp "Postgres USER [${PG_USER_DEFAULT}]: " PG_USER;  PG_USER="${PG_USER:-$PG_USER_DEFAULT}"
-read -rp "Postgres PASS [${PG_PASS_DEFAULT}]: " PG_PASS;  PG_PASS="${PG_PASS:-$PG_PASS_DEFAULT}"
+read -rp "Postgres HOST [${PG_HOST_DEFAULT}]: " PG_HOST; PG_HOST="${PG_HOST:-$PG_HOST_DEFAULT}"
+read -rp "Postgres PORT [${PG_PORT_DEFAULT}]: " PG_PORT; PG_PORT="${PG_PORT:-$PG_PORT_DEFAULT}"
+read -rp "Postgres USER [${PG_USER_DEFAULT}]: " PG_USER; PG_USER="${PG_USER:-$PG_USER_DEFAULT}"
+read -rp "Postgres PASS [${PG_PASS_DEFAULT}]: " PG_PASS; PG_PASS="${PG_PASS:-$PG_PASS_DEFAULT}"
 read -rp "Postgres DB (novo p/ Chatwoot) [${PG_DB_DEFAULT}]: " PG_DB; PG_DB="${PG_DB:-$PG_DB_DEFAULT}"
 
 echo
@@ -73,14 +77,14 @@ read -rp "SMTP_PASSWORD []: " SMTP_PASSWORD
 read -rp "SMTP_DOMAIN (ex.: seu-dominio.com) []: " SMTP_DOMAIN
 read -rp "MAILER_SENDER_EMAIL (ex.: no-reply@${DOMAIN_NAME}) []: " MAILER_SENDER_EMAIL
 
-ENABLE_ACCOUNT_SIGNUP_DEFAULT="true"
-read -rp "Permitir criação de conta no primeiro acesso? (true/false) [${ENABLE_ACCOUNT_SIGNUP_DEFAULT}]: " ENABLE_ACCOUNT_SIGNUP
-ENABLE_ACCOUNT_SIGNUP="${ENABLE_ACCOUNT_SIGNUP:-$ENABLE_ACCOUNT_SIGNUP_DEFAULT}"
+ENABLE_ACCOUNT_SIGNUP="true"
+read -rp "Permitir criação de conta no primeiro acesso? (true/false) [${ENABLE_ACCOUNT_SIGNUP}]: " TMP
+ENABLE_ACCOUNT_SIGNUP="${TMP:-$ENABLE_ACCOUNT_SIGNUP}"
 
 SECRET_KEY_BASE="$(openssl rand -hex 64)"
 
-# ---------- .env.chatwoot ----------
-ENV_CW="$CHAT_DIR/.env.chatwoot"
+# === .env.chatwoot ===
+ENV_CW="$WORKDIR/.env.chatwoot"
 cat > "$ENV_CW" <<EOF
 # === Chatwoot ENV ===
 RAILS_ENV=production
@@ -114,20 +118,21 @@ SMTP_PASSWORD=${SMTP_PASSWORD}
 SMTP_DOMAIN=${SMTP_DOMAIN}
 MAILER_SENDER_EMAIL=${MAILER_SENDER_EMAIL}
 
+# Docker infos
 DOCKER_ENV=true
 EOF
 echo "✅ .env salvo em: $ENV_CW"
 
-# ---------- docker-compose.chatwoot.yml ----------
-DC="$CHAT_DIR/docker-compose.chatwoot.yml"
-cat > "$DC" <<YAML
+# === docker-compose.chatwoot.yml (usa placeholders para evitar conflito com crases) ===
+DC="$WORKDIR/docker-compose.chatwoot.yml"
+cat > "$DC" <<'YAML'
 services:
   chatwoot:
-    image: chatwoot/chatwoot:latest
+    image: __CHATWOOT_IMAGE__
     container_name: chatwoot
     restart: always
     env_file:
-      - $ENV_CW
+      - .env.chatwoot
     environment:
       RAILS_LOG_TO_STDOUT: "true"
     volumes:
@@ -136,7 +141,7 @@ services:
       - chatwoot-worker
     labels:
       - traefik.enable=true
-      - traefik.http.routers.chatwoot.rule=Host(\`${CHAT_SUB}.${DOMAIN_NAME}\`)
+      - traefik.http.routers.chatwoot.rule=Host(`__CHATWOOT_HOST__`)
       - traefik.http.routers.chatwoot.entrypoints=web,websecure
       - traefik.http.routers.chatwoot.tls=true
       - traefik.http.routers.chatwoot.tls.certresolver=mytlschallenge
@@ -144,11 +149,11 @@ services:
     networks: [ web ]
 
   chatwoot-worker:
-    image: chatwoot/chatwoot:latest
+    image: __CHATWOOT_IMAGE__
     container_name: chatwoot-worker
     restart: always
     env_file:
-      - $ENV_CW
+      - .env.chatwoot
     command: bundle exec sidekiq -C config/sidekiq.yml
     volumes:
       - chatwoot_storage:/app/storage
@@ -162,48 +167,55 @@ networks:
     external: true
     name: web
 YAML
+
+CHATWOOT_HOST="${CHAT_SUB}.${DOMAIN_NAME}"
+CHATWOOT_IMAGE="chatwoot/chatwoot:${CHATWOOT_IMAGE_TAG}"
+sed -i "s|__CHATWOOT_HOST__|${CHATWOOT_HOST}|g" "$DC"
+sed -i "s|__CHATWOOT_IMAGE__|${CHATWOOT_IMAGE}|g" "$DC"
 echo "✅ Compose salvo em: $DC"
 
-# ---------- Rede 'web' ----------
+# === Garante rede 'web' existente ===
 if ! docker network inspect web >/dev/null 2>&1; then
   echo "ℹ️ Criando rede 'web'…"
   docker network create web >/dev/null
 fi
 
-# ---------- Criação do banco (idempotente) ----------
+# === Cria DB se existir container postgres ===
 echo "=== Checando/criando banco '${PG_DB}' ==="
-PG_CONT="$(docker ps --format '{{.Names}}' | grep -E '^postgres$' || true)"
-if [[ -z "${PG_CONT}" ]]; then
-  echo "⚠️  Container 'postgres' não encontrado. Pulei criação automática do banco."
-else
-  docker exec -i "$PG_CONT" psql -U "$PG_USER" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${PG_DB}'" | grep -q 1 \
-    || docker exec -i "$PG_CONT" psql -U "$PG_USER" -d postgres -c "CREATE DATABASE ${PG_DB};"
+if docker ps --format '{{.Names}}' | grep -qw postgres; then
+  docker compose exec -T postgres psql -U "${PG_USER}" -d postgres \
+    -c "SELECT 1 FROM pg_database WHERE datname='${PG_DB}';" | grep -q 1 \
+  || docker compose exec -T postgres psql -U "${PG_USER}" -d postgres -c "CREATE DATABASE ${PG_DB};"
   echo "✅ Banco OK: ${PG_DB}"
+else
+  echo "⚠️ Container 'postgres' não encontrado. Pulei criação automática do DB."
 fi
 
-# ---------- Migrations / prepare ----------
+# === Migrations (sem bash; chama rails direto) ===
 echo "=== Executando migrations (db:chatwoot_prepare) ==="
-docker compose -f "$DC" run --rm chatwoot bash -lc "bundle exec rails db:chatwoot_prepare" >/dev/null
+docker compose -f "$DC" --project-directory "$WORKDIR" run --rm chatwoot \
+  bundle exec rails db:chatwoot_prepare
 echo "✅ Migrations concluídas"
 
-# ---------- Sobe serviços ----------
-docker compose -f "$DC" up -d chatwoot chatwoot-worker
+# === Sobe serviços ===
+docker compose -f "$DC" --project-directory "$WORKDIR" up -d chatwoot chatwoot-worker
 
-# ---------- Healthcheck como comando (chat-check) ----------
-HC_URL="https://raw.githubusercontent.com/mutuadigital/imautomaia/refs/heads/main/chatwoot-healthcheck.sh"
-install -d "$CHAT_DIR"
-curl -fsSL "$HC_URL" -o "$CHAT_DIR/chatwoot-healthcheck.sh"
-chmod +x "$CHAT_DIR/chatwoot-healthcheck.sh"
+# === Healthcheck (chat-check) ===
+INSTALL_DIR="/opt/chatwoot"
+mkdir -p "$INSTALL_DIR"
+curl -fsSL "$HC_URL" -o "$INSTALL_DIR/chatwoot-healthcheck.sh"
+chmod +x "$INSTALL_DIR/chatwoot-healthcheck.sh"
 
-cat > /usr/local/bin/chat-check <<EOF
+cat > "$WRAPPER_BIN" <<EOF
 #!/usr/bin/env bash
-ENV_CW="$ENV_CW" exec "$CHAT_DIR/chatwoot-healthcheck.sh" "\$@"
+ENV_CW="$ENV_CW" exec "$INSTALL_DIR/chatwoot-healthcheck.sh" "\$@"
 EOF
-chmod +x /usr/local/bin/chat-check
+chmod +x "$WRAPPER_BIN"
 
 echo
-echo "🎉 Pronto!"
-echo "URL:  https://${CHAT_SUB}.${DOMAIN_NAME}"
-echo "Healthcheck a qualquer momento:  chat-check"
+echo "✔ Healthcheck instalado. Use:  chat-check"
 echo
-echo "Obs.: se SMTP ficou em branco, envio de e-mails (confirmação/senha) fica desativado até configurar."
+echo "=== URLs ==="
+echo "Chatwoot: https://${CHATWOOT_HOST}"
+echo
+echo "Pronto. 🚀"
