@@ -86,35 +86,35 @@ echo "✅ htpasswd criado para painel Traefik (${TRAEFIK_USER})."
 
 # =========================
 # helper: garantir que a rede 'web' exista no compose existente
+# (versão simples/portável; sem regex avançada)
 # =========================
 ensure_network_web() {
-  # Só age se existir docker-compose.yml
   [[ -f docker-compose.yml ]] || return 0
 
-  # Se qualquer serviço usar 'web', garante a seção global 'networks: web:'
-  if grep -Eq 'networks:[[:space:]]*\[[[:space:]]*web[[:space:]]*\]' docker-compose.yml || \
-     awk '
-       /^[[:space:]]{2,}networks:[[:space:]]*$/,/^[^[:space:]]/ {
-         if ($1=="-" && $2=="web") f=1
-       }
-       END{ exit f?0:1 }
-     ' docker-compose.yml
-  then
-    awk '
-      BEGIN{in=0;hasNetworks=0;hasWeb=0;inserted=0}
-      /^networks:[[:space:]]*$/ {in=1; hasNetworks=1; print; next}
-      in && /^[[:space:]]{2}web:[[:space:]]*$/ {hasWeb=1}
-      in && /^[^[:space:]]/ {
-        if(hasNetworks && !hasWeb && !inserted){ print "  web:\n    driver: bridge"; inserted=1 }
-        in=0
-      }
-      {print}
-      END{
-        if(hasNetworks && !hasWeb && !inserted){ print "  web:\n    driver: bridge" }
-        if(!hasNetworks){ print "\nnetworks:\n  web:\n    driver: bridge" }
-      }
-    ' docker-compose.yml > .dc.tmp && mv .dc.tmp docker-compose.yml
+  # Já tem seção 'networks:' com 'web:'?
+  if grep -Eq '^[[:space:]]*networks:[[:space:]]*$' docker-compose.yml && \
+     grep -Eq '^[[:space:]]{2}web:[[:space:]]*$' docker-compose.yml; then
+    return 0
   fi
+
+  # Não tem nenhuma seção 'networks:' → cria no final
+  if ! grep -Eq '^[[:space:]]*networks:[[:space:]]*$' docker-compose.yml; then
+    printf "\nnetworks:\n  web:\n    driver: bridge\n" >> docker-compose.yml
+    return 0
+  fi
+
+  # Tem 'networks:' mas não tem 'web:' → insere logo após a 1ª ocorrência de 'networks:'
+  awk '
+    BEGIN{added=0}
+    {
+      print
+      if (!added && $0 ~ /^[[:space:]]*networks:[[:space:]]*$/) {
+        print "  web:"
+        print "    driver: bridge"
+        added=1
+      }
+    }
+  ' docker-compose.yml > .dc.tmp && mv .dc.tmp docker-compose.yml
 }
 
 # =========================
