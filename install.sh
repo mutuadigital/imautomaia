@@ -293,10 +293,19 @@ YAML
   echo "✅ docker-compose.yml criado."
 else
   echo "ℹ️ Usando docker-compose.yml existente"
+    echo "ℹ️ Usando docker-compose.yml existente"
   # garantir que o Portainer exista no compose (injeta bloco antes de 'volumes:')
   if ! grep -Eq '^[[:space:]]{2}portainer:' docker-compose.yml; then
     echo "ℹ️ Adicionando serviço 'portainer' ao docker-compose.yml"
-    PORTAINER_BLOCK="$(cat <<'PYAML'
+
+    # Verifica se a rede 'web' existe na seção global de networks
+    if awk '/^networks:[[:space:]]*$/ {in=1; next} in && /^[^[:space:]]/ {in=0} in && /^[[:space:]]{2}web:[[:space:]]*$/ {found=1} END{exit found?0:1}' docker-compose.yml; then
+      PORTAINER_NET_LINE='    networks: [ web ]'
+    else
+      PORTAINER_NET_LINE=''  # usa rede default
+    fi
+
+    PORTAINER_BLOCK_HEADER="$(cat <<'PYAML'
   portainer:
     image: portainer/portainer-ce:latest
     container_name: portainer
@@ -311,9 +320,17 @@ else
       - traefik.http.routers.portainer.tls=true
       - traefik.http.routers.portainer.tls.certresolver=mytlschallenge
       - traefik.http.services.portainer.loadbalancer.server.port=9000
-    networks: [ web ]
 PYAML
 )"
+    # monta o bloco completo (com ou sem networks)
+    if [[ -n "$PORTAINER_NET_LINE" ]]; then
+      PORTAINER_BLOCK="${PORTAINER_BLOCK_HEADER}"$'\n'"${PORTAINER_NET_LINE}"$'\n'"    networks: [ web ]"
+      # a linha acima duplica, então ajusta:
+      PORTAINER_BLOCK="${PORTAINER_BLOCK_HEADER}"$'\n'"${PORTAINER_NET_LINE}"
+    else
+      PORTAINER_BLOCK="${PORTAINER_BLOCK_HEADER}"
+    fi
+
     awk -v block="$PORTAINER_BLOCK" '
       BEGIN{done=0}
       /^volumes:$/ && !done { print block; print; done=1; next }
