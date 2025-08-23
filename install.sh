@@ -304,7 +304,12 @@ fi
 
 # ============== sobe base (Traefik/DB) ==============
 echo "== Subindo Traefik =="
-docker compose up -d traefik
+# Garantir que o Traefik também esteja na rede *_web (quando existir)
+TRAEFIK_CID="$(docker compose ps -q traefik || true)"
+WEB_NET="$(docker network ls --format '{{.Name}}' | grep '_web$' | head -n1 || true)"
+if [[ -n "$TRAEFIK_CID" && -n "$WEB_NET" ]]; then
+  docker network connect "$WEB_NET" "$TRAEFIK_CID" 2>/dev/null || true
+fi
 
 echo "== Subindo Postgres + Redis =="
 docker compose up -d postgres redis
