@@ -85,6 +85,39 @@ chmod 640 traefik/htpasswd
 echo "✅ htpasswd criado para painel Traefik (${TRAEFIK_USER})."
 
 # =========================
+# helper: garantir que a rede 'web' exista no compose existente
+# =========================
+ensure_network_web() {
+  # Só age se existir docker-compose.yml
+  [[ -f docker-compose.yml ]] || return 0
+
+  # Se qualquer serviço usar 'web', garante a seção global 'networks: web:'
+  if grep -Eq 'networks:[[:space:]]*\[[[:space:]]*web[[:space:]]*\]' docker-compose.yml || \
+     awk '
+       /^[[:space:]]{2,}networks:[[:space:]]*$/,/^[^[:space:]]/ {
+         if ($1=="-" && $2=="web") f=1
+       }
+       END{ exit f?0:1 }
+     ' docker-compose.yml
+  then
+    awk '
+      BEGIN{in=0;hasNetworks=0;hasWeb=0;inserted=0}
+      /^networks:[[:space:]]*$/ {in=1; hasNetworks=1; print; next}
+      in && /^[[:space:]]{2}web:[[:space:]]*$/ {hasWeb=1}
+      in && /^[^[:space:]]/ {
+        if(hasNetworks && !hasWeb && !inserted){ print "  web:\n    driver: bridge"; inserted=1 }
+        in=0
+      }
+      {print}
+      END{
+        if(hasNetworks && !hasWeb && !inserted){ print "  web:\n    driver: bridge" }
+        if(!hasNetworks){ print "\nnetworks:\n  web:\n    driver: bridge" }
+      }
+    ' docker-compose.yml > .dc.tmp && mv .dc.tmp docker-compose.yml
+  fi
+}
+
+# =========================
 # docker-compose.yml
 # - cria completo se não existir
 # =========================
@@ -293,7 +326,8 @@ YAML
   echo "✅ docker-compose.yml criado."
 else
   echo "ℹ️ Usando docker-compose.yml existente"
-    echo "ℹ️ Usando docker-compose.yml existente"
+  ensure_network_web
+
   # garantir que o Portainer exista no compose (injeta bloco antes de 'volumes:')
   if ! grep -Eq '^[[:space:]]{2}portainer:' docker-compose.yml; then
     echo "ℹ️ Adicionando serviço 'portainer' ao docker-compose.yml"
@@ -322,10 +356,7 @@ else
       - traefik.http.services.portainer.loadbalancer.server.port=9000
 PYAML
 )"
-    # monta o bloco completo (com ou sem networks)
     if [[ -n "$PORTAINER_NET_LINE" ]]; then
-      PORTAINER_BLOCK="${PORTAINER_BLOCK_HEADER}"$'\n'"${PORTAINER_NET_LINE}"$'\n'"    networks: [ web ]"
-      # a linha acima duplica, então ajusta:
       PORTAINER_BLOCK="${PORTAINER_BLOCK_HEADER}"$'\n'"${PORTAINER_NET_LINE}"
     else
       PORTAINER_BLOCK="${PORTAINER_BLOCK_HEADER}"
