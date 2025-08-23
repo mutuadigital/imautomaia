@@ -13,10 +13,7 @@ ask() {
     echo "$var"
   fi
 }
-
-require() {
-  command -v "$1" >/dev/null 2>&1 || { echo "Falta o comando '$1'."; exit 1; }
-}
+require() { command -v "$1" >/dev/null 2>&1 || { echo "Falta o comando '$1'."; exit 1; }; }
 
 # === pré-checagens ===
 require docker
@@ -77,7 +74,7 @@ echo "${TRAEFIK_USER}:${HTPASS_HASH}" > traefik/htpasswd
 chmod 640 traefik/htpasswd
 echo "✅ htpasswd criado para painel Traefik (${TRAEFIK_USER})."
 
-# === docker compose (se não existir) ===
+# === docker-compose.yml (cria se não existir) ===
 if [[ ! -f docker-compose.yml ]]; then
 cat > docker-compose.yml <<'YAML'
 services:
@@ -205,26 +202,37 @@ services:
     networks: [ web ]
 
   evolution:
-    image: evoapicloud/evolution-api
+    image: evoapicloud/evolution-api:latest
     container_name: evolution-api
     restart: always
     environment:
       AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
-      # Banco
+
+      # Banco (persistência)
       DATABASE_ENABLED: "true"
       DATABASE_PROVIDER: "postgresql"
       DATABASE_CONNECTION_URI: postgresql://${N8N_DB_USER}:${N8N_DB_PASS}@postgres:5432/evolution?schema=public
       DATABASE_CONNECTION_CLIENT_NAME: evolution_v2
-      # Cache
+
+      # Cache (Redis)
       CACHE_REDIS_ENABLED: "true"
       CACHE_REDIS_URI: redis://redis:6379/6
       CACHE_REDIS_PREFIX_KEY: evolution
       CACHE_LOCAL_ENABLED: "false"
-      # Manager / WS / CORS
-      SERVER_TYPE: https
+
+      # Server interno em HTTP (TLS só no Traefik)
+      SERVER_TYPE: "http"
+      SERVER_SSL: "false"
+      HTTPS: "false"
+
+      # URL externa (para QR/links) e WS/CORS
       SERVER_URL: https://${EVO_SUBDOMAIN}.${DOMAIN_NAME}
       WEBSOCKET_ENABLED: "true"
       CORS_ORIGIN: "*"
+      WHITELIST_ORIGINS: "https://${EVO_SUBDOMAIN}.${DOMAIN_NAME},https://${SUBDOMAIN}.${DOMAIN_NAME},https://chat.${DOMAIN_NAME}"
+
+      # Networking (Baileys) — prefere IPv4
+      NODE_OPTIONS: "--dns-result-order=ipv4first"
     volumes:
       - evolution_store:/evolution/store
       - evolution_instances:/evolution/instances
@@ -270,18 +278,19 @@ networks:
     driver: bridge
 YAML
   echo "✅ docker-compose.yml criado."
+else
+  echo "ℹ️ Usando docker-compose.yml existente"
 fi
 
-# opcional: override de middleware apikey (comentado por padrão)
+# (override opcional para auth no Traefik do Evolution)
 if [[ ! -f docker-compose.override.yml ]]; then
 cat > docker-compose.override.yml <<'YAML'
-# Descomente as 3 linhas de middleware abaixo caso o Manager acuse "Unauthorized".
+# Descomente as linhas abaixo se quiser proteger o host da Evolution com header "apikey".
 services:
   evolution:
     labels:
       # - traefik.http.middlewares.evo-apikey.headers.customrequestheaders.apikey=${EVOLUTION_API_KEY}
       # - traefik.http.routers.evolution.middlewares=evo-apikey@docker
-      # (mantenha também as labels do router definidas no compose principal)
 YAML
   echo "✅ docker-compose.override.yml criado (opcional)."
 fi
@@ -306,17 +315,15 @@ docker compose up -d n8n n8n-worker portainer
 echo "== Subindo Evolution =="
 docker compose up -d evolution
 
-# === instala healthcheck (atalho no PATH + cópia no repo) ===
+# === healthcheck (atalho) ===
 HC=/usr/local/bin/stack-health
 cat > "$HC" <<'BASH'
 #!/usr/bin/env bash
 set -o pipefail
 
-# carregando .env (procura no cwd e em /root)
+# carrega .env
 ENV_FILE=""
-for f in "./.env" "/root/.env"; do
-  [[ -f "$f" ]] && ENV_FILE="$f" && break
-done
+for f in "./.env" "/root/.env"; do [[ -f "$f" ]] && ENV_FILE="$f" && break; done
 [[ -n "$ENV_FILE" ]] && source "$ENV_FILE"
 
 DOMAIN="${DOMAIN_NAME:-example.com}"
@@ -328,45 +335,38 @@ KEY="${EVOLUTION_API_KEY:-}"
 
 ok()   { printf "✅ %s\n" "$*"; }
 fail() { printf "❌ %s\n" "$*"; }
-
-echo "=== Healthcheck Stack ==="
-echo "n8n:       https://${N8N_HOST}/rest/healthz"
-echo "evolution: https://${EVO_HOST}/instance/fetchInstances"
-echo "portainer: https://${PORTAINER_FQDN}"
-echo "traefik:   https://${TRAEFIK_FQDN}"
-echo
-
-echo "--- Docker containers ---"
-docker ps --format ' - {{.Names}}: {{.Status}}' \
- | egrep 'traefik|postgres|redis|n8n|evolution|portainer' || true
-echo
-
 code() { curl -sk -o /dev/null -w '%{http_code}' "$1"; }
 
-c=$(code "https://${TRAEFIK_FQDN}") ; [[ "$c" =~ ^(200|301|302|401|403|404)$ ]] && ok "traefik https (${c})" || fail "traefik https (${c})"
-c=$(code "https://${PORTAINER_FQDN}") ; [[ "$c" =~ ^(200|301|302|401|403)$ ]] && ok "portainer https (${c})" || fail "portainer https (${c})"
-c=$(code "https://${N8N_HOST}/rest/healthz") ; [[ "$c" == "200" ]] && ok "n8n health (${c})" || fail "n8n health (${c})"
+echo "=== Healthcheck Stack ==="
+docker ps --format ' - {{.Names}}: {{.Status}}' | egrep 'traefik|postgres|redis|n8n|evolution|portainer' || true
+echo
+
+echo "1) Traefik:   https://${TRAEFIK_FQDN}"
+c=$(code "https://${TRAEFIK_FQDN}") ; [[ "$c" =~ ^(200|301|302|401|403|404)$ ]] && ok "traefik (${c})" || fail "traefik (${c})"
+
+echo "2) Portainer: https://${PORTAINER_FQDN}"
+c=$(code "https://${PORTAINER_FQDN}") ; [[ "$c" =~ ^(200|301|302|401|403)$ ]] && ok "portainer (${c})" || fail "portainer (${c})"
+
+echo "3) n8n health:"
+c=$(code "https://${N8N_HOST}/rest/healthz") ; [[ "$c" == "200" ]] && ok "n8n (${c})" || fail "n8n (${c})"
+
+echo "4) Evolution interno (127.0.0.1:8080):"
+docker exec -it evolution-api sh -lc 'apk add --no-cache curl >/dev/null 2>&1 || true; curl -sI http://127.0.0.1:8080 | head -n1 || true' || true
+
+echo "5) Evolution público: https://${EVO_HOST}"
+c=$(code "https://${EVO_HOST}") ; [[ "$c" =~ ^(200|404)$ ]] && ok "evolution (${c})" || fail "evolution (${c})"
 
 if [[ -n "$KEY" ]]; then
+  echo "6) Evolution fetchInstances:"
   c=$(curl -sk -H "apikey: $KEY" -o /dev/null -w '%{http_code}' "https://${EVO_HOST}/instance/fetchInstances")
-  [[ "$c" == "200" ]] && ok "evolution list (${c})" || fail "evolution list (${c})"
-else
-  echo "ℹ️  EVOLUTION_API_KEY não encontrado no .env; pulando list."
+  [[ "$c" == "200" ]] && ok "fetchInstances (${c})" || fail "fetchInstances (${c})"
 fi
 
-echo
-echo "--- Cert (wa) ---"
-openssl s_client -servername "${EVO_HOST}" -connect "${EVO_HOST}:443" </dev/null 2>/dev/null \
- | openssl x509 -noout -issuer -subject -dates | sed -n '1,3p' || true
-
-echo
 echo "=== Done ==="
 BASH
 chmod +x "$HC"
-# cópia local para o diretório do projeto
 cp "$HC" ./hostinger-healthcheck.sh 2>/dev/null || true
 echo "✅ Healthcheck instalado: use 'stack-health' (ou ./hostinger-healthcheck.sh)"
-
 
 # === prints úteis ===
 echo
