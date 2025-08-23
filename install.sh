@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# install.sh - Stack Traefik + Postgres + Redis + n8n (+ worker) + Evolution API + Portainer
+#   - Traefik v3 (TLS/ACME Let's Encrypt)
+#   - Portainer em HTTP (9000) via --http-enabled (recomendado com reverse-proxy)
+#   - n8n em queue mode com Redis/Postgres
+#   - Evolution API v2 fixada (evita que 'latest' mude sozinho)
+#   - Healthcheck 'stack-health' com fallback de endpoints
+# -----------------------------------------------------------------------------
 set -euo pipefail
 
 # =========================
@@ -22,6 +30,7 @@ require() { command -v "$1" >/dev/null 2>&1 || { echo "Falta o comando '$1'."; e
 # =========================
 require docker
 require openssl
+require curl
 
 # =========================
 # perguntas
@@ -36,10 +45,10 @@ SSL_EMAIL="$(ask "Email para Let's Encrypt" "${SSL_EMAIL:-you@example.com}")"
 PORTAINER_HOST="$(ask "Host do Portainer (FQDN)" "${PORTAINER_HOST:-portainer.${DOMAIN_NAME}}")"
 TRAEFIK_HOST="$(ask "Host do Traefik (FQDN)" "${TRAEFIK_HOST:-traefik.${DOMAIN_NAME}}")"
 
-N8N_DB_USER="$(ask "Postgres USER (n8n)" "${N8N_DB_USER:-n8n}")"
+N8N_DB_USER="$(ask "Postgres USER (n8n/evolution)" "${N8N_DB_USER:-n8n}")"
 N8N_DB_PASS_DEFAULT="$(randhex 16)"
 N8N_DB_PASS="$(ask "Postgres PASS (auto se vazio)" "${N8N_DB_PASS:-$N8N_DB_PASS_DEFAULT}")"
-N8N_DB_NAME="$(ask "Postgres DB" "${N8N_DB_NAME:-n8ndb}")"
+N8N_DB_NAME="$(ask "Postgres DB (n8n)" "${N8N_DB_NAME:-n8ndb}")"
 
 EVOLUTION_API_KEY_DEFAULT="$(randhex 16)"
 EVOLUTION_API_KEY="$(ask "Evolution API Global Key (auto se vazio)" "${EVOLUTION_API_KEY:-$EVOLUTION_API_KEY_DEFAULT}")"
@@ -85,27 +94,30 @@ chmod 640 traefik/htpasswd
 echo "✅ htpasswd criado para painel Traefik (${TRAEFIK_USER})."
 
 # =========================
-# helper: garantir rede 'web' no compose
+# helper: garantir rede 'web' no compose e remover 'version:'
 # =========================
 ensure_network_web() {
   [[ -f docker-compose.yml ]] || return 0
-  if grep -Eq '^[[:space:]]*networks:[[:space:]]*$' docker-compose.yml && \
-     grep -Eq '^[[:space:]]{2}web:[[:space:]]*$' docker-compose.yml; then
-    return 0
-  fi
+
+  # remove 'version:' obsoleta (Compose v2)
+  sed -i '/^version:/d' docker-compose.yml || true
+
+  # cria bloco networks:web se não existir
   if ! grep -Eq '^[[:space:]]*networks:[[:space:]]*$' docker-compose.yml; then
     printf "\nnetworks:\n  web:\n    driver: bridge\n" >> docker-compose.yml
     return 0
   fi
-  awk '
-    BEGIN{added=0}
-    { print
-      if (!added && $0 ~ /^[[:space:]]*networks:[[:space:]]*$/) {
-        print "  web:"
-        print "    driver: bridge"
-        added=1
-      }
-    }' docker-compose.yml > .dc.tmp && mv .dc.tmp docker-compose.yml
+  if ! awk '/^[[:space:]]*networks:[[:space:]]*$/{f=1} f && /^[[:space:]]*web:[[:space:]]*$/{print;exit}' docker-compose.yml >/dev/null; then
+    awk '
+      BEGIN{added=0}
+      { print
+        if (!added && $0 ~ /^[[:space:]]*networks:[[:space:]]*$/) {
+          print "  web:"
+          print "    driver: bridge"
+          added=1
+        }
+      }' docker-compose.yml > .dc.tmp && mv .dc.tmp docker-compose.yml
+  fi
 }
 
 # =========================
@@ -148,6 +160,7 @@ services:
       - traefik.http.routers.traefik.service=api@internal
       - traefik.http.middlewares.traefik-auth.basicauth.usersfile=/etc/traefik/htpasswd
       - traefik.http.routers.traefik.middlewares=traefik-auth@docker
+      - traefik.docker.network=web
     networks: [ web ]
 
   redis:
@@ -200,6 +213,7 @@ services:
       - redis
     labels:
       - traefik.enable=true
+      - traefik.docker.network=web
       - traefik.http.routers.n8n.rule=Host(`${SUBDOMAIN}.${DOMAIN_NAME}`)
       - traefik.http.routers.n8n.entrypoints=web,websecure
       - traefik.http.routers.n8n.tls=true
@@ -238,7 +252,7 @@ services:
     networks: [ web ]
 
   evolution:
-    image: evoapicloud/evolution-api:latest
+    image: evoapicloud/evolution-api:v2.3.1
     container_name: evolution-api
     restart: always
     environment:
@@ -277,6 +291,7 @@ services:
       - redis
     labels:
       - traefik.enable=true
+      - traefik.docker.network=web
       - traefik.http.routers.evolution.rule=Host(`${EVO_SUBDOMAIN}.${DOMAIN_NAME}`)
       - traefik.http.routers.evolution.entrypoints=web,websecure
       - traefik.http.routers.evolution.tls=true
@@ -288,11 +303,14 @@ services:
     image: portainer/portainer-ce:latest
     container_name: portainer
     restart: always
+    command:
+      - --http-enabled
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - portainer_data:/data
     labels:
       - traefik.enable=true
+      - traefik.docker.network=web
       - traefik.http.routers.portainer.rule=Host(`${PORTAINER_HOST}`)
       - traefik.http.routers.portainer.entrypoints=web,websecure
       - traefik.http.routers.portainer.tls=true
@@ -316,6 +334,7 @@ YAML
   echo "✅ docker-compose.yml criado."
 else
   echo "ℹ️ Usando docker-compose.yml existente"
+  # garantir rede e remover 'version:'
   ensure_network_web
 
   inject_service_before_volumes() {
@@ -334,11 +353,14 @@ else
     image: portainer/portainer-ce:latest
     container_name: portainer
     restart: always
+    command:
+      - --http-enabled
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - portainer_data:/data
     labels:
       - traefik.enable=true
+      - traefik.docker.network=web
       - traefik.http.routers.portainer.rule=Host(`${PORTAINER_HOST}`)
       - traefik.http.routers.portainer.entrypoints=web,websecure
       - traefik.http.routers.portainer.tls=true
@@ -360,7 +382,7 @@ PYAML
     echo "ℹ️ Adicionando serviço 'evolution' ao docker-compose.yml"
     EVOLUTION_BLOCK="$(cat <<'PYAML'
   evolution:
-    image: evoapicloud/evolution-api:latest
+    image: evoapicloud/evolution-api:v2.3.1
     container_name: evolution-api
     restart: always
     environment:
@@ -389,6 +411,7 @@ PYAML
       - redis
     labels:
       - traefik.enable=true
+      - traefik.docker.network=web
       - traefik.http.routers.evolution.rule=Host(`${EVO_SUBDOMAIN}.${DOMAIN_NAME}`)
       - traefik.http.routers.evolution.entrypoints=web,websecure
       - traefik.http.routers.evolution.tls=true
@@ -464,14 +487,26 @@ PORTAINER_FQDN="${PORTAINER_HOST:-portainer.${DOMAIN}}"
 TRAEFIK_FQDN="${TRAEFIK_HOST:-traefik.${DOMAIN}}"
 KEY="${EVOLUTION_API_KEY:-}"
 ok(){ printf "✅ %s\n" "$*"; } ; fail(){ printf "❌ %s\n" "$*"; }
-code(){ curl -sk -o /dev/null -w '%{http_code}' "$1"; }
+code(){ curl -skL -o /dev/null -w '%{http_code}' "$1"; }
+
 echo "=== Healthcheck Stack ==="
 docker ps --format ' - {{.Names}}: {{.Status}}' | egrep 'traefik|postgres|redis|n8n|evolution|portainer' || true
 echo
+
+# traefik: aceita 200/301/302/401/403/404
 c=$(code "https://${TRAEFIK_FQDN}") ; [[ "$c" =~ ^(200|301|302|401|403|404)$ ]] && ok "traefik (${c})" || fail "traefik (${c})"
+
+# portainer: aceita 200/301/302/401/403
 c=$(code "https://${PORTAINER_FQDN}") ; [[ "$c" =~ ^(200|301|302|401|403)$ ]] && ok "portainer (${c})" || fail "portainer (${c})"
-c=$(code "https://${N8N_HOST}/rest/healthz") ; [[ "$c" == "200" ]] && ok "n8n (${c})" || fail "n8n (${c})"
-docker exec -it evolution-api sh -lc 'apk add --no-cache curl >/dev/null 2>&1 || true; curl -sI http://127.0.0.1:8080 | head -n1 || true' || true
+
+# n8n: tenta /healthz e depois /rest/healthz
+c=$(code "https://${N8N_HOST}/healthz")
+if [[ "$c" != "200" ]]; then
+  c=$(code "https://${N8N_HOST}/rest/healthz")
+fi
+[[ "$c" == "200" ]] && ok "n8n (${c})" || fail "n8n (${c})"
+
+# evolution: raiz pode 200/404; endpoint com apikey deve 200
 c=$(code "https://${EVO_HOST}") ; [[ "$c" =~ ^(200|404)$ ]] && ok "evolution (${c})" || fail "evolution (${c})"
 if [[ -n "$KEY" ]]; then
   c=$(curl -sk -H "apikey: $KEY" -o /dev/null -w '%{http_code}' "https://${EVO_HOST}/instance/fetchInstances")
