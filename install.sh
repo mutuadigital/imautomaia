@@ -282,19 +282,6 @@ else
   echo "ℹ️ Usando docker-compose.yml existente"
 fi
 
-# (override opcional para auth no Traefik do Evolution)
-if [[ ! -f docker-compose.override.yml ]]; then
-cat > docker-compose.override.yml <<'YAML'
-# Descomente as linhas abaixo se quiser proteger o host da Evolution com header "apikey".
-services:
-  evolution:
-    labels:
-      # - traefik.http.middlewares.evo-apikey.headers.customrequestheaders.apikey=${EVOLUTION_API_KEY}
-      # - traefik.http.routers.evolution.middlewares=evo-apikey@docker
-YAML
-  echo "✅ docker-compose.override.yml criado (opcional)."
-fi
-
 # === sobe serviços base ===
 echo "== Subindo Traefik =="
 docker compose up -d traefik
