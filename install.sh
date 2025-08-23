@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# === util ===
+# =========================
+# util
+# =========================
 randhex() { openssl rand -hex "${1:-24}"; }
 ask() {
   local prompt="$1" default="${2:-}" var
@@ -15,11 +17,15 @@ ask() {
 }
 require() { command -v "$1" >/dev/null 2>&1 || { echo "Falta o comando '$1'."; exit 1; }; }
 
-# === pré-checagens ===
+# =========================
+# pré-checagens
+# =========================
 require docker
 require openssl
 
-# === perguntas ===
+# =========================
+# perguntas
+# =========================
 echo "== Configuração =="
 DOMAIN_NAME="$(ask "Domínio raiz (ex.: imautomaia.com.br)" "${DOMAIN_NAME:-}")"
 SUBDOMAIN="$(ask "Subdomínio do n8n" "${SUBDOMAIN:-n8n}")"
@@ -45,7 +51,9 @@ HTPASS_HASH="$(openssl passwd -apr1 "$TRAEFIK_PASS")"
 
 N8N_ENCRYPTION_KEY="${N8N_ENCRYPTION_KEY:-$(randhex 24)}"
 
-# === grava .env ===
+# =========================
+# grava .env
+# =========================
 cat > .env <<EOF
 DOMAIN_NAME=${DOMAIN_NAME}
 SUBDOMAIN=${SUBDOMAIN}
@@ -68,13 +76,18 @@ EVOLUTION_API_KEY=${EVOLUTION_API_KEY}
 EOF
 echo "✅ .env escrito."
 
-# === diretórios ===
+# =========================
+# diretórios / htpasswd
+# =========================
 mkdir -p traefik
 echo "${TRAEFIK_USER}:${HTPASS_HASH}" > traefik/htpasswd
 chmod 640 traefik/htpasswd
 echo "✅ htpasswd criado para painel Traefik (${TRAEFIK_USER})."
 
-# === docker-compose.yml (cria se não existir) ===
+# =========================
+# docker-compose.yml
+# - cria completo se não existir
+# =========================
 if [[ ! -f docker-compose.yml ]]; then
 cat > docker-compose.yml <<'YAML'
 services:
@@ -280,29 +293,80 @@ YAML
   echo "✅ docker-compose.yml criado."
 else
   echo "ℹ️ Usando docker-compose.yml existente"
+  # garantir que o Portainer exista no compose (injeta bloco antes de 'volumes:')
+  if ! grep -Eq '^[[:space:]]{2}portainer:' docker-compose.yml; then
+    echo "ℹ️ Adicionando serviço 'portainer' ao docker-compose.yml"
+    PORTAINER_BLOCK="$(cat <<'PYAML'
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.portainer.rule=Host(`${PORTAINER_HOST}`)
+      - traefik.http.routers.portainer.entrypoints=web,websecure
+      - traefik.http.routers.portainer.tls=true
+      - traefik.http.routers.portainer.tls.certresolver=mytlschallenge
+      - traefik.http.services.portainer.loadbalancer.server.port=9000
+    networks: [ web ]
+PYAML
+)"
+    awk -v block="$PORTAINER_BLOCK" '
+      BEGIN{done=0}
+      /^volumes:$/ && !done { print block; print; done=1; next }
+      { print }
+    ' docker-compose.yml > .docker-compose.tmp && mv .docker-compose.tmp docker-compose.yml
+
+    # garante volume portainer_data na seção 'volumes:'
+    if ! grep -Eq '^  portainer_data:' docker-compose.yml; then
+      sed -i '0,/^volumes:$/s//volumes:\n  portainer_data:/' docker-compose.yml
+    fi
+  fi
 fi
 
-# === sobe serviços base ===
+# =========================
+# sobe serviços base
+# =========================
 echo "== Subindo Traefik =="
 docker compose up -d traefik
 
 echo "== Subindo Postgres + Redis =="
 docker compose up -d postgres redis
 
-# === cria DB evolution (se necessário) ===
-echo "== Criando DB 'evolution' se não existir =="
+# aguarda Postgres responder antes de criar DB
+echo "== Aguardando Postgres responder =="
 export PGPASSWORD="${N8N_DB_PASS}"
+for i in {1..30}; do
+  if docker compose exec -T postgres psql -U "${N8N_DB_USER}" -d postgres -c "select 1" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
+
+# cria DB evolution (se necessário)
+echo "== Criando DB 'evolution' se não existir =="
 docker compose exec -T postgres psql -U "${N8N_DB_USER}" -d postgres -tc "SELECT 1 FROM pg_database WHERE datname='evolution'" | grep -q 1 \
   || docker compose exec -T postgres psql -U "${N8N_DB_USER}" -d postgres -c "CREATE DATABASE evolution OWNER ${N8N_DB_USER};"
 
-# === sobe apps ===
+# =========================
+# sobe apps
+# =========================
 echo "== Subindo n8n / worker / Portainer =="
-docker compose up -d n8n n8n-worker portainer
+SERVS=(n8n n8n-worker)
+if docker compose config --services | grep -qx portainer; then
+  SERVS+=(portainer)
+fi
+docker compose up -d "${SERVS[@]}"
 
 echo "== Subindo Evolution =="
 docker compose up -d evolution
 
-# === healthcheck (atalho) ===
+# =========================
+# healthcheck rápido
+# =========================
 HC=/usr/local/bin/stack-health
 cat > "$HC" <<'BASH'
 #!/usr/bin/env bash
@@ -355,7 +419,9 @@ chmod +x "$HC"
 cp "$HC" ./hostinger-healthcheck.sh 2>/dev/null || true
 echo "✅ Healthcheck instalado: use 'stack-health' (ou ./hostinger-healthcheck.sh)"
 
-# === prints úteis ===
+# =========================
+# prints finais
+# =========================
 echo
 echo "🎉 Concluído!"
 echo "Traefik:   https://${TRAEFIK_HOST}   (user: ${TRAEFIK_USER} / pass: ${TRAEFIK_PASS})"
