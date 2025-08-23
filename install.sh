@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 # -----------------------------------------------------------------------------
 # install.sh - Traefik v3 + Postgres + Redis + n8n (+ worker) + Evolution API + Portainer
-# - Dashboards SEMPRE habilitados:
-#   * Traefik (BasicAuth usando htpasswd)
-#   * Portainer (admin com senha definida aqui, via --admin-password bcrypt)
-# - Sem 'traefik.docker.network' (Traefik escolhe a rede compartilhada correta)
-# - Portainer atrás do Traefik em HTTP:9000 (simples e estável)
+# Dashboards SEMPRE ativos:
+# - Traefik (api@internal) com BasicAuth (usuário/senha definidos aqui)
+# - Portainer com admin pré-configurado (hash bcrypt via --admin-password)
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
-# ========================= util =========================
+# =============== util =================
 randhex() { openssl rand -hex "${1:-24}"; }
 ask() {
   local prompt="$1" default="${2:-}" var
@@ -18,16 +16,16 @@ ask() {
 }
 require() { command -v "$1" >/dev/null 2>&1 || { echo "Falta o comando '$1'."; exit 1; }; }
 bcrypt_hash() {
-  # Gera bcrypt com o htpasswd do httpd dentro de um contêiner (sem depender de pacotes no host)
-  docker run --rm httpd:2.4-alpine sh -lc "htpasswd -nbB admin \"$1\"" | cut -d: -f2-
+  # Gera bcrypt com htpasswd dentro de um Alpine efêmero
+  docker run --rm alpine:3 sh -lc 'apk add --no-cache apache2-utils >/dev/null && htpasswd -nbB admin "$1"' -- "$1" | cut -d: -f2-
 }
 
-# ===================== pré-checagens ====================
+# ============ pré-checagens ============
 require docker
 require openssl
 require curl
 
-# ====================== perguntas =======================
+# ================ perguntas ================
 echo "== Configuração =="
 DOMAIN_NAME="$(ask "Domínio raiz (ex.: imautomaia.com.br)" "${DOMAIN_NAME:-}")"
 SUBDOMAIN="$(ask "Subdomínio do n8n" "${SUBDOMAIN:-n8n}")"
@@ -51,15 +49,13 @@ read -r -s -p "Senha do painel Traefik (deixe vazio p/ gerar): " TRAEFIK_PASS ||
 [[ -z "${TRAEFIK_PASS:-}" ]] && TRAEFIK_PASS="$(randhex 12)"
 HTPASS_HASH="$(openssl passwd -apr1 "$TRAEFIK_PASS")"
 
-# Portainer: senha do admin (usuário é sempre 'admin')
 read -r -s -p "Senha do Portainer (admin) (deixe vazio p/ gerar): " PORTAINER_ADMIN_PASS || true; echo
 [[ -z "${PORTAINER_ADMIN_PASS:-}" ]] && PORTAINER_ADMIN_PASS="$(randhex 12)"
-PORTAINER_ADMIN_HASH="$(bcrypt_hash "$PORTAINER_ADMIN_PASS")"  # bcrypt exigido por --admin-password  [docs]
-# -----------------------------------------------------------------------------
+PORTAINER_ADMIN_HASH="$(bcrypt_hash "$PORTAINER_ADMIN_PASS")"  # --admin-password requer bcrypt. Docs: docs.portainer.io/advanced/cli
 
 N8N_ENCRYPTION_KEY="${N8N_ENCRYPTION_KEY:-$(randhex 24)}"
 
-# ======================= grava .env =====================
+# ================ .env =================
 cat > .env <<EOF
 DOMAIN_NAME=${DOMAIN_NAME}
 SUBDOMAIN=${SUBDOMAIN}
@@ -80,18 +76,18 @@ N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
 # Evolution
 EVOLUTION_API_KEY=${EVOLUTION_API_KEY}
 
-# Portainer (hash bcrypt)
+# Portainer
 PORTAINER_ADMIN_HASH=${PORTAINER_ADMIN_HASH}
 EOF
 echo "✅ .env escrito."
 
-# ========== diretórios / Traefik htpasswd ===============
+# ========== Traefik htpasswd ==========
 mkdir -p traefik
 echo "${TRAEFIK_USER}:${HTPASS_HASH}" > traefik/htpasswd
 chmod 640 traefik/htpasswd
 echo "✅ htpasswd criado para painel Traefik (${TRAEFIK_USER})."
 
-# ============ helper: rede 'web' e tirar 'version:' =====
+# ===== helper: rede 'web' e remover 'version:' =====
 ensure_network_web() {
   [[ -f docker-compose.yml ]] || return 0
   sed -i '/^version:/d' docker-compose.yml || true
@@ -103,7 +99,7 @@ ensure_network_web() {
   fi
 }
 
-# ================= docker-compose.yml base ==============
+# ============ docker-compose.yml ============
 if [[ ! -f docker-compose.yml ]]; then
 cat > docker-compose.yml <<'YAML'
 services:
@@ -112,9 +108,7 @@ services:
     image: traefik:v3.5
     container_name: traefik
     restart: always
-    ports:
-      - "80:80"
-      - "443:443"
+    ports: ["80:80", "443:443"]
     command:
       - "--api=true"
       - "--api.insecure=false"
@@ -147,8 +141,7 @@ services:
     image: redis:6
     container_name: redis
     restart: always
-    volumes:
-      - redis_data:/data
+    volumes: [ "redis_data:/data" ]
     networks: [ web ]
 
   postgres:
@@ -159,8 +152,7 @@ services:
       POSTGRES_USER: ${N8N_DB_USER}
       POSTGRES_PASSWORD: ${N8N_DB_PASS}
       POSTGRES_DB: ${N8N_DB_NAME}
-    volumes:
-      - pg_data:/var/lib/postgresql/data
+    volumes: [ "pg_data:/var/lib/postgresql/data" ]
     networks: [ web ]
 
   n8n:
@@ -234,30 +226,21 @@ services:
       TZ: ${GENERIC_TIMEZONE}
       LOG_LEVEL: debug
       AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
-
-      # Banco (persistência)
       DATABASE_ENABLED: "true"
       DATABASE_PROVIDER: "postgresql"
       DATABASE_CONNECTION_URI: postgresql://${N8N_DB_USER}:${N8N_DB_PASS}@postgres:5432/evolution?schema=public
       DATABASE_CONNECTION_CLIENT_NAME: evolution_v2
-
-      # Cache (Redis)
       CACHE_REDIS_ENABLED: "true"
       CACHE_REDIS_URI: redis://redis:6379/6
       CACHE_REDIS_PREFIX_KEY: evolution
       CACHE_LOCAL_ENABLED: "false"
-
-      # HTTP interno (TLS só no Traefik)
       SERVER_TYPE: "http"
       SERVER_SSL: "false"
       HTTPS: "false"
-
-      # Externo (QR/links) + WS/CORS
       SERVER_URL: https://${EVO_SUBDOMAIN}.${DOMAIN_NAME}
       WEBSOCKET_ENABLED: "true"
       CORS_ORIGIN: "*"
       WHITELIST_ORIGINS: "https://${EVO_SUBDOMAIN}.${DOMAIN_NAME},https://${SUBDOMAIN}.${DOMAIN_NAME},https://chat.${DOMAIN_NAME}"
-
       NODE_OPTIONS: "--dns-result-order=ipv4first"
     volumes:
       - evolution_store:/evolution/store
@@ -307,108 +290,26 @@ YAML
 else
   echo "ℹ️ Usando docker-compose.yml existente"
   ensure_network_web
-
-  inject_before_volumes() {
-    local block="$1"
-    awk -v block="$block" 'BEGIN{d=0} /^volumes:$/ && !d {print block; print; d=1; next} {print}' docker-compose.yml > .docker-compose.tmp && mv .docker-compose.tmp docker-compose.yml
-  }
-
-  # Remover qualquer traefik.docker.network antigo (evitar 504 por rede errada)
+  # remove qualquer label antiga de rede do traefik (evita 504 por rede errada)
   sed -i '/traefik\.docker\.network/d' docker-compose.yml || true
-
-  # Injetar/ajustar Portainer
-  if ! grep -Eq '^[[:space:]]{2}portainer:' docker-compose.yml; then
-    echo "ℹ️ Adicionando serviço 'portainer' ao docker-compose.yml"
-    PORTAINER_BLOCK="$(cat <<'PYAML'
-  portainer:
-    image: portainer/portainer-ce:latest
-    container_name: portainer
-    restart: always
-    command:
-      - --admin-password=${PORTAINER_ADMIN_HASH}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - portainer_data:/data
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.portainer.rule=Host(`${PORTAINER_HOST}`)
-      - traefik.http.routers.portainer.entrypoints=web,websecure
-      - traefik.http.routers.portainer.tls=true
-      - traefik.http.routers.portainer.tls.certresolver=mytlschallenge
-      - traefik.http.services.portainer.loadbalancer.server.port=9000
-    networks: [ web ]
-PYAML
-)"; inject_before_volumes "$PORTAINER_BLOCK"
-    grep -Eq '^  portainer_data:' docker-compose.yml || sed -i '0,/^volumes:$/s//volumes:\n  portainer_data:/' docker-compose.yml
-  else
-    # força as labels/porta corretas e remove network label antigo
+  # injeta/ajusta Portainer com --admin-password se estiver faltando
+  if grep -Eq '^[[:space:]]{2}portainer:' docker-compose.yml; then
     sed -i ':/portainer:/,/networks:/ {
       s|traefik\.http\.services\.portainer\.loadbalancer\.server\.port=.*|traefik.http.services.portainer.loadbalancer.server.port=9000|;
+      /--admin-password=/! s|container_name: portainer|container_name: portainer\n    command:\n      - --admin-password=${PORTAINER_ADMIN_HASH}|
       /traefik\.docker\.network/d
     }' docker-compose.yml
-    # injeta flag --admin-password se faltar
-    if ! awk '/portainer:/{f=1} f && /command:/ {print "ok"; exit}' docker-compose.yml >/dev/null; then
-      sed -i '/container_name: portainer/a\    command:\n      - --admin-password=${PORTAINER_ADMIN_HASH}' docker-compose.yml
-    fi
-  fi
-
-  # Injetar Evolution se faltar
-  if ! grep -Eq '^[[:space:]]{2}evolution:' docker-compose.yml && \
-     ! grep -Eq '^[[:space:]]{2}evolution-api:' docker-compose.yml; then
-    echo "ℹ️ Adicionando serviço 'evolution' ao docker-compose.yml"
-    EVOLUTION_BLOCK="$(cat <<'PYAML'
-  evolution:
-    image: evoapicloud/evolution-api:v2.3.1
-    container_name: evolution-api
-    restart: always
-    environment:
-      TZ: ${GENERIC_TIMEZONE}
-      LOG_LEVEL: debug
-      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
-      DATABASE_ENABLED: "true"
-      DATABASE_PROVIDER: "postgresql"
-      DATABASE_CONNECTION_URI: postgresql://${N8N_DB_USER}:${N8N_DB_PASS}@postgres:5432/evolution?schema=public
-      DATABASE_CONNECTION_CLIENT_NAME: evolution_v2
-      CACHE_REDIS_ENABLED: "true"
-      CACHE_REDIS_URI: redis://redis:6379/6
-      CACHE_REDIS_PREFIX_KEY: evolution
-      CACHE_LOCAL_ENABLED: "false"
-      SERVER_TYPE: "http"
-      SERVER_SSL: "false"
-      HTTPS: "false"
-      SERVER_URL: https://${EVO_SUBDOMAIN}.${DOMAIN_NAME}
-      WEBSOCKET_ENABLED: "true"
-      CORS_ORIGIN: "*"
-      WHITELIST_ORIGINS: "https://${EVO_SUBDOMAIN}.${DOMAIN_NAME},https://${SUBDOMAIN}.${DOMAIN_NAME},https://chat.${DOMAIN_NAME}"
-      NODE_OPTIONS: "--dns-result-order=ipv4first"
-    volumes:
-      - evolution_store:/evolution/store
-      - evolution_instances:/evolution/instances
-    depends_on: [ postgres, redis ]
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.evolution.rule=Host(`${EVO_SUBDOMAIN}.${DOMAIN_NAME}`)
-      - traefik.http.routers.evolution.entrypoints=web,websecure
-      - traefik.http.routers.evolution.tls=true
-      - traefik.http.routers.evolution.tls.certresolver=mytlschallenge
-      - traefik.http.services.evolution.loadbalancer.server.port=8080
-    networks: [ web ]
-PYAML
-)"; inject_before_volumes "$EVOLUTION_BLOCK"
-    for v in evolution_store evolution_instances; do
-      grep -Eq "^  ${v}:" docker-compose.yml || sed -i "0,/^volumes:$/s//volumes:\n  ${v}:/" docker-compose.yml
-    done
   fi
 fi
 
-# =================== sobe base (Traefik/DB) =============
+# ============== sobe base (Traefik/DB) ==============
 echo "== Subindo Traefik =="
-docker compose up -d --force-recreate traefik
+docker compose up -d traefik
 
 echo "== Subindo Postgres + Redis =="
 docker compose up -d postgres redis
 
-# aguarda Postgres responder antes de criar DB evolution
+# espera Postgres
 echo "== Aguardando Postgres responder =="
 export PGPASSWORD="${N8N_DB_PASS}"
 for i in {1..30}; do
@@ -416,18 +317,19 @@ for i in {1..30}; do
   sleep 2
 done
 
+# cria DB evolution
 echo "== Criando DB 'evolution' se não existir =="
 docker compose exec -T postgres psql -U "${N8N_DB_USER}" -d postgres -tc "SELECT 1 FROM pg_database WHERE datname='evolution'" | grep -q 1 \
   || docker compose exec -T postgres psql -U "${N8N_DB_USER}" -d postgres -c "CREATE DATABASE evolution OWNER ${N8N_DB_USER};"
 
-# =================== sobe apps ==========================
+# ============== sobe apps ============================
 echo "== Subindo n8n / worker / Portainer =="
-docker compose up -d --force-recreate n8n n8n-worker portainer
+docker compose up -d n8n n8n-worker portainer
 
 echo "== Subindo Evolution =="
-docker compose up -d --force-recreate evolution || true
+docker compose up -d evolution || true
 
-# =================== Healthcheck ========================
+# ============== healthcheck ==========================
 HC=/usr/local/bin/stack-health
 cat > "$HC" <<'BASH'
 #!/usr/bin/env bash
@@ -450,8 +352,7 @@ echo
 c=$(code "https://${TRAEFIK_FQDN}") ; [[ "$c" =~ ^(200|301|302|401|403|404)$ ]] && ok "traefik (${c})" || fail "traefik (${c})"
 c=$(code "https://${PORTAINER_FQDN}") ; [[ "$c" =~ ^(200|301|302|401|403)$ ]] && ok "portainer (${c})" || fail "portainer (${c})"
 
-c=$(code "https://${N8N_HOST}/healthz")
-if [[ "$c" != "200" ]]; then c=$(code "https://${N8N_HOST}/rest/healthz"); fi
+c=$(code "https://${N8N_HOST}/healthz"); [[ "$c" == "200" ]] || c=$(code "https://${N8N_HOST}/rest/healthz")
 [[ "$c" == "200" ]] && ok "n8n (${c})" || fail "n8n (${c})"
 
 c=$(code "https://${EVO_HOST}") ; [[ "$c" =~ ^(200|404)$ ]] && ok "evolution (${c})" || fail "evolution (${c})"
@@ -465,7 +366,7 @@ chmod +x "$HC"
 cp "$HC" ./hostinger-healthcheck.sh 2>/dev/null || true
 echo "✅ Healthcheck instalado: use 'stack-health' (ou ./hostinger-healthcheck.sh)"
 
-# =================== prints finais ======================
+# ============== prints ===============================
 echo
 echo "🎉 Concluído!"
 echo "Traefik:   https://${TRAEFIK_HOST}   (user: ${TRAEFIK_USER} / pass: ${TRAEFIK_PASS})"
