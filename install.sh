@@ -85,41 +85,31 @@ chmod 640 traefik/htpasswd
 echo "✅ htpasswd criado para painel Traefik (${TRAEFIK_USER})."
 
 # =========================
-# helper: garantir que a rede 'web' exista no compose existente
-# (versão simples/portável; sem regex avançada)
+# helper: garantir rede 'web' no compose
 # =========================
 ensure_network_web() {
   [[ -f docker-compose.yml ]] || return 0
-
-  # Já tem seção 'networks:' com 'web:'?
   if grep -Eq '^[[:space:]]*networks:[[:space:]]*$' docker-compose.yml && \
      grep -Eq '^[[:space:]]{2}web:[[:space:]]*$' docker-compose.yml; then
     return 0
   fi
-
-  # Não tem nenhuma seção 'networks:' → cria no final
   if ! grep -Eq '^[[:space:]]*networks:[[:space:]]*$' docker-compose.yml; then
     printf "\nnetworks:\n  web:\n    driver: bridge\n" >> docker-compose.yml
     return 0
   fi
-
-  # Tem 'networks:' mas não tem 'web:' → insere logo após a 1ª ocorrência de 'networks:'
   awk '
     BEGIN{added=0}
-    {
-      print
+    { print
       if (!added && $0 ~ /^[[:space:]]*networks:[[:space:]]*$/) {
         print "  web:"
         print "    driver: bridge"
         added=1
       }
-    }
-  ' docker-compose.yml > .dc.tmp && mv .dc.tmp docker-compose.yml
+    }' docker-compose.yml > .dc.tmp && mv .dc.tmp docker-compose.yml
 }
 
 # =========================
-# docker-compose.yml
-# - cria completo se não existir
+# docker-compose.yml (cria se não existir)
 # =========================
 if [[ ! -f docker-compose.yml ]]; then
 cat > docker-compose.yml <<'YAML'
@@ -328,18 +318,18 @@ else
   echo "ℹ️ Usando docker-compose.yml existente"
   ensure_network_web
 
-  # garantir que o Portainer exista no compose (injeta bloco antes de 'volumes:')
+  inject_service_before_volumes() {
+    local block="$1"
+    awk -v block="$block" '
+      BEGIN{done=0}
+      /^volumes:$/ && !done { print block; print; done=1; next }
+      { print }' docker-compose.yml > .docker-compose.tmp && mv .docker-compose.tmp docker-compose.yml
+  }
+
+  # injeta PORTAINER se não existir
   if ! grep -Eq '^[[:space:]]{2}portainer:' docker-compose.yml; then
     echo "ℹ️ Adicionando serviço 'portainer' ao docker-compose.yml"
-
-    # Verifica se a rede 'web' existe na seção global de networks
-    if awk '/^networks:[[:space:]]*$/ {in=1; next} in && /^[^[:space:]]/ {in=0} in && /^[[:space:]]{2}web:[[:space:]]*$/ {found=1} END{exit found?0:1}' docker-compose.yml; then
-      PORTAINER_NET_LINE='    networks: [ web ]'
-    else
-      PORTAINER_NET_LINE=''  # usa rede default
-    fi
-
-    PORTAINER_BLOCK_HEADER="$(cat <<'PYAML'
+    PORTAINER_BLOCK="$(cat <<'PYAML'
   portainer:
     image: portainer/portainer-ce:latest
     container_name: portainer
@@ -354,24 +344,65 @@ else
       - traefik.http.routers.portainer.tls=true
       - traefik.http.routers.portainer.tls.certresolver=mytlschallenge
       - traefik.http.services.portainer.loadbalancer.server.port=9000
+    networks: [ web ]
 PYAML
 )"
-    if [[ -n "$PORTAINER_NET_LINE" ]]; then
-      PORTAINER_BLOCK="${PORTAINER_BLOCK_HEADER}"$'\n'"${PORTAINER_NET_LINE}"
-    else
-      PORTAINER_BLOCK="${PORTAINER_BLOCK_HEADER}"
-    fi
-
-    awk -v block="$PORTAINER_BLOCK" '
-      BEGIN{done=0}
-      /^volumes:$/ && !done { print block; print; done=1; next }
-      { print }
-    ' docker-compose.yml > .docker-compose.tmp && mv .docker-compose.tmp docker-compose.yml
-
-    # garante volume portainer_data na seção 'volumes:'
+    inject_service_before_volumes "$PORTAINER_BLOCK"
+    # garante volume
     if ! grep -Eq '^  portainer_data:' docker-compose.yml; then
       sed -i '0,/^volumes:$/s//volumes:\n  portainer_data:/' docker-compose.yml
     fi
+  fi
+
+  # injeta EVOLUTION se não existir
+  if ! grep -Eq '^[[:space:]]{2}evolution:' docker-compose.yml && \
+     ! grep -Eq '^[[:space:]]{2}evolution-api:' docker-compose.yml; then
+    echo "ℹ️ Adicionando serviço 'evolution' ao docker-compose.yml"
+    EVOLUTION_BLOCK="$(cat <<'PYAML'
+  evolution:
+    image: evoapicloud/evolution-api:latest
+    container_name: evolution-api
+    restart: always
+    environment:
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
+      DATABASE_ENABLED: "true"
+      DATABASE_PROVIDER: "postgresql"
+      DATABASE_CONNECTION_URI: postgresql://${N8N_DB_USER}:${N8N_DB_PASS}@postgres:5432/evolution?schema=public
+      DATABASE_CONNECTION_CLIENT_NAME: evolution_v2
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: redis://redis:6379/6
+      CACHE_REDIS_PREFIX_KEY: evolution
+      CACHE_LOCAL_ENABLED: "false"
+      SERVER_TYPE: "http"
+      SERVER_SSL: "false"
+      HTTPS: "false"
+      SERVER_URL: https://${EVO_SUBDOMAIN}.${DOMAIN_NAME}
+      WEBSOCKET_ENABLED: "true"
+      CORS_ORIGIN: "*"
+      WHITELIST_ORIGINS: "https://${EVO_SUBDOMAIN}.${DOMAIN_NAME},https://${SUBDOMAIN}.${DOMAIN_NAME},https://chat.${DOMAIN_NAME}"
+      NODE_OPTIONS: "--dns-result-order=ipv4first"
+    volumes:
+      - evolution_store:/evolution/store
+      - evolution_instances:/evolution/instances
+    depends_on:
+      - postgres
+      - redis
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.evolution.rule=Host(`${EVO_SUBDOMAIN}.${DOMAIN_NAME}`)
+      - traefik.http.routers.evolution.entrypoints=web,websecure
+      - traefik.http.routers.evolution.tls=true
+      - traefik.http.routers.evolution.tls.certresolver=mytlschallenge
+      - traefik.http.services.evolution.loadbalancer.server.port=8080
+    networks: [ web ]
+PYAML
+)"
+    inject_service_before_volumes "$EVOLUTION_BLOCK"
+    # garante volumes
+    for v in evolution_store evolution_instances; do
+      grep -Eq "^  ${v}:" docker-compose.yml || \
+        sed -i "0,/^volumes:$/s//volumes:\n  ${v}:/" docker-compose.yml
+    done
   fi
 fi
 
@@ -410,7 +441,12 @@ fi
 docker compose up -d "${SERVS[@]}"
 
 echo "== Subindo Evolution =="
-docker compose up -d evolution
+if docker compose config --services | grep -qx evolution; then
+  docker compose up -d evolution
+else
+  echo "⚠️  Serviço 'evolution' não encontrado no compose (algo impediu a injeção)."
+  echo "    Abra docker-compose.yml e verifique o bloco 'evolution'."
+fi
 
 # =========================
 # healthcheck rápido
@@ -419,48 +455,28 @@ HC=/usr/local/bin/stack-health
 cat > "$HC" <<'BASH'
 #!/usr/bin/env bash
 set -o pipefail
-
-# carrega .env
-ENV_FILE=""
-for f in "./.env" "/root/.env"; do [[ -f "$f" ]] && ENV_FILE="$f" && break; done
+ENV_FILE=""; for f in "./.env" "/root/.env"; do [[ -f "$f" ]] && ENV_FILE="$f" && break; done
 [[ -n "$ENV_FILE" ]] && source "$ENV_FILE"
-
 DOMAIN="${DOMAIN_NAME:-example.com}"
 N8N_HOST="${SUBDOMAIN}.${DOMAIN}"
 EVO_HOST="${EVO_SUBDOMAIN}.${DOMAIN}"
 PORTAINER_FQDN="${PORTAINER_HOST:-portainer.${DOMAIN}}"
 TRAEFIK_FQDN="${TRAEFIK_HOST:-traefik.${DOMAIN}}"
 KEY="${EVOLUTION_API_KEY:-}"
-
-ok()   { printf "✅ %s\n" "$*"; }
-fail() { printf "❌ %s\n" "$*"; }
-code() { curl -sk -o /dev/null -w '%{http_code}' "$1"; }
-
+ok(){ printf "✅ %s\n" "$*"; } ; fail(){ printf "❌ %s\n" "$*"; }
+code(){ curl -sk -o /dev/null -w '%{http_code}' "$1"; }
 echo "=== Healthcheck Stack ==="
 docker ps --format ' - {{.Names}}: {{.Status}}' | egrep 'traefik|postgres|redis|n8n|evolution|portainer' || true
 echo
-
-echo "1) Traefik:   https://${TRAEFIK_FQDN}"
 c=$(code "https://${TRAEFIK_FQDN}") ; [[ "$c" =~ ^(200|301|302|401|403|404)$ ]] && ok "traefik (${c})" || fail "traefik (${c})"
-
-echo "2) Portainer: https://${PORTAINER_FQDN}"
 c=$(code "https://${PORTAINER_FQDN}") ; [[ "$c" =~ ^(200|301|302|401|403)$ ]] && ok "portainer (${c})" || fail "portainer (${c})"
-
-echo "3) n8n health:"
 c=$(code "https://${N8N_HOST}/rest/healthz") ; [[ "$c" == "200" ]] && ok "n8n (${c})" || fail "n8n (${c})"
-
-echo "4) Evolution interno (127.0.0.1:8080):"
 docker exec -it evolution-api sh -lc 'apk add --no-cache curl >/dev/null 2>&1 || true; curl -sI http://127.0.0.1:8080 | head -n1 || true' || true
-
-echo "5) Evolution público: https://${EVO_HOST}"
 c=$(code "https://${EVO_HOST}") ; [[ "$c" =~ ^(200|404)$ ]] && ok "evolution (${c})" || fail "evolution (${c})"
-
 if [[ -n "$KEY" ]]; then
-  echo "6) Evolution fetchInstances:"
   c=$(curl -sk -H "apikey: $KEY" -o /dev/null -w '%{http_code}' "https://${EVO_HOST}/instance/fetchInstances")
   [[ "$c" == "200" ]] && ok "fetchInstances (${c})" || fail "fetchInstances (${c})"
 fi
-
 echo "=== Done ==="
 BASH
 chmod +x "$HC"
