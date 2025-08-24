@@ -6,9 +6,11 @@
 #   - Portainer com admin pré-configurado (hash bcrypt via --admin-password-file)
 #
 # Este instalador:
-#   - Faz backup do docker-compose.yml anterior (se existir) e escreve um NOVO, limpo e consistente
-#   - Coloca TODOS os serviços na mesma rede "web" (evita 504 por mismatch de rede)
-#   - Evita duplicar "command:" e evita variáveis não setadas em labels
+#   - Reescreve o docker-compose.yml (faz backup do antigo)
+#   - Coloca TODOS os serviços na mesma rede "web" (evita 504 por mismatch)
+#   - Usa arquivo-segredo p/ senha do Portainer (evita "variável não setada" do bcrypt)
+#   - Remove flags de runner do n8n (causavam restart em algumas versões)
+#   - Healthcheck com fallbacks p/ Evolution v2
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -21,7 +23,7 @@ ask() {
 }
 require() { command -v "$1" >/dev/null 2>&1 || { echo "Falta o comando '$1'."; exit 1; }; }
 bcrypt_hash() {
-  # Gera bcrypt (htpasswd -B) dentro de container Alpine (sem depender de pacotes no host)
+  # Gera bcrypt (htpasswd -B) dentro de container Alpine (sem depender do host)
   docker run --rm alpine:3 sh -lc 'apk add --no-cache apache2-utils >/dev/null && htpasswd -nbB admin "$1"' -- "$1" | cut -d: -f2-
 }
 
@@ -123,7 +125,7 @@ services:
       - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
       - "--entrypoints.websecure.address=:443"
       - "--log.level=INFO"
-      - "--certificatesresolvers.mytlschallenge.acme.email=${SSL_EMAIL}"
+      - "--certificatesresolvers.mytlschallenge.acme.email=\${SSL_EMAIL}"
       - "--certificatesresolvers.mytlschallenge.acme.storage=/letsencrypt/acme.json"
       - "--certificatesresolvers.mytlschallenge.acme.httpchallenge.entrypoint=web"
     volumes:
@@ -132,7 +134,7 @@ services:
       - ./traefik/htpasswd:/etc/traefik/htpasswd:ro
     labels:
       - traefik.enable=true
-      - traefik.http.routers.traefik.rule=Host(`${TRAEFIK_HOST}`)
+      - traefik.http.routers.traefik.rule=Host(`\${TRAEFIK_HOST}`)
       - traefik.http.routers.traefik.entrypoints=web,websecure
       - traefik.http.routers.traefik.tls=true
       - traefik.http.routers.traefik.tls.certresolver=mytlschallenge
@@ -153,9 +155,9 @@ services:
     container_name: postgres
     restart: always
     environment:
-      POSTGRES_USER: ${N8N_DB_USER}
-      POSTGRES_PASSWORD: ${N8N_DB_PASS}
-      POSTGRES_DB: ${N8N_DB_NAME}
+      POSTGRES_USER: \${N8N_DB_USER}
+      POSTGRES_PASSWORD: \${N8N_DB_PASS}
+      POSTGRES_DB: \${N8N_DB_NAME}
     volumes: [ "pg_data:/var/lib/postgresql/data" ]
     networks: [ web ]
 
@@ -164,30 +166,38 @@ services:
     container_name: n8n
     restart: always
     environment:
-      N8N_HOST: ${SUBDOMAIN}.${DOMAIN_NAME}
+      # Base URL
+      N8N_HOST: \${SUBDOMAIN}.\${DOMAIN_NAME}
       N8N_PROTOCOL: https
       N8N_PORT: 5678
-      WEBHOOK_URL: https://${SUBDOMAIN}.${DOMAIN_NAME}/
+      WEBHOOK_URL: https://\${SUBDOMAIN}.\${DOMAIN_NAME}/
+
+      # DB (Postgres)
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: postgres
       DB_POSTGRESDB_PORT: 5432
-      DB_POSTGRESDB_DATABASE: ${N8N_DB_NAME}
-      DB_POSTGRESDB_USER: ${N8N_DB_USER}
-      DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASS}
-      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE}
+      DB_POSTGRESDB_DATABASE: \${N8N_DB_NAME}
+      DB_POSTGRESDB_USER: \${N8N_DB_USER}
+      DB_POSTGRESDB_PASSWORD: \${N8N_DB_PASS}
+
+      # Queue (Redis)
       EXECUTIONS_MODE: queue
       QUEUE_BULL_REDIS_HOST: redis
       QUEUE_BULL_REDIS_PORT: 6379
-      N8N_RUNNERS_ENABLED: "true"
-      OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS: "true"
-      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      # Variáveis de runner REMOVIDAS para evitar crash em algumas versões
+      # OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS: "true"  # (opcional) ative depois se quiser
+
+      # Outros
+      GENERIC_TIMEZONE: \${GENERIC_TIMEZONE}
+      N8N_ENCRYPTION_KEY: \${N8N_ENCRYPTION_KEY}
+      N8N_DIAGNOSTICS_ENABLED: "false"
     volumes:
       - n8n_data:/home/node/.n8n
       - /local-files:/files
     depends_on: [ postgres, redis ]
     labels:
       - traefik.enable=true
-      - traefik.http.routers.n8n.rule=Host(`${SUBDOMAIN}.${DOMAIN_NAME}`)
+      - traefik.http.routers.n8n.rule=Host(`\${SUBDOMAIN}.\${DOMAIN_NAME}`)
       - traefik.http.routers.n8n.entrypoints=web,websecure
       - traefik.http.routers.n8n.tls=true
       - traefik.http.routers.n8n.tls.certresolver=mytlschallenge
@@ -196,7 +206,7 @@ services:
       - traefik.http.middlewares.n8n.headers.browserXSSFilter=true
       - traefik.http.middlewares.n8n.headers.contentTypeNosniff=true
       - traefik.http.middlewares.n8n.headers.forceSTSHeader=true
-      - traefik.http.middlewares.n8n.headers.SSLHost=${DOMAIN_NAME}
+      - traefik.http.middlewares.n8n.headers.SSLHost=\${DOMAIN_NAME}
       - traefik.http.middlewares.n8n.headers.STSIncludeSubdomains=true
       - traefik.http.middlewares.n8n.headers.STSPreload=true
       - traefik.http.routers.n8n.middlewares=n8n@docker
@@ -215,10 +225,10 @@ services:
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: postgres
       DB_POSTGRESDB_PORT: 5432
-      DB_POSTGRESDB_DATABASE: ${N8N_DB_NAME}
-      DB_POSTGRESDB_USER: ${N8N_DB_USER}
-      DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASS}
-      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      DB_POSTGRESDB_DATABASE: \${N8N_DB_NAME}
+      DB_POSTGRESDB_USER: \${N8N_DB_USER}
+      DB_POSTGRESDB_PASSWORD: \${N8N_DB_PASS}
+      N8N_ENCRYPTION_KEY: \${N8N_ENCRYPTION_KEY}
     depends_on: [ redis, postgres ]
     networks: [ web ]
 
@@ -227,14 +237,14 @@ services:
     container_name: evolution-api
     restart: always
     environment:
-      TZ: ${GENERIC_TIMEZONE}
+      TZ: \${GENERIC_TIMEZONE}
       LOG_LEVEL: debug
-      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
+      AUTHENTICATION_API_KEY: \${EVOLUTION_API_KEY}
 
       # Banco (persistência)
       DATABASE_ENABLED: "true"
       DATABASE_PROVIDER: "postgresql"
-      DATABASE_CONNECTION_URI: postgresql://${N8N_DB_USER}:${N8N_DB_PASS}@postgres:5432/evolution?schema=public
+      DATABASE_CONNECTION_URI: postgresql://\${N8N_DB_USER}:\${N8N_DB_PASS}@postgres:5432/evolution?schema=public
       DATABASE_CONNECTION_CLIENT_NAME: evolution_v2
 
       # Cache (Redis)
@@ -249,10 +259,10 @@ services:
       HTTPS: "false"
 
       # Externo (QR/links) + WS/CORS
-      SERVER_URL: https://${EVO_SUBDOMAIN}.${DOMAIN_NAME}
+      SERVER_URL: https://\${EVO_SUBDOMAIN}.\${DOMAIN_NAME}
       WEBSOCKET_ENABLED: "true"
       CORS_ORIGIN: "*"
-      WHITELIST_ORIGINS: "https://${EVO_SUBDOMAIN}.${DOMAIN_NAME},https://${SUBDOMAIN}.${DOMAIN_NAME},https://chat.${DOMAIN_NAME}"
+      WHITELIST_ORIGINS: "https://\${EVO_SUBDOMAIN}.\${DOMAIN_NAME},https://\${SUBDOMAIN}.\${DOMAIN_NAME},https://chat.\${DOMAIN_NAME}"
 
       NODE_OPTIONS: "--dns-result-order=ipv4first"
     volumes:
@@ -261,7 +271,7 @@ services:
     depends_on: [ postgres, redis ]
     labels:
       - traefik.enable=true
-      - traefik.http.routers.evolution.rule=Host(`${EVO_SUBDOMAIN}.${DOMAIN_NAME}`)
+      - traefik.http.routers.evolution.rule=Host(`\${EVO_SUBDOMAIN}.\${DOMAIN_NAME}`)
       - traefik.http.routers.evolution.entrypoints=web,websecure
       - traefik.http.routers.evolution.tls=true
       - traefik.http.routers.evolution.tls.certresolver=mytlschallenge
@@ -280,7 +290,7 @@ services:
       - ./portainer/admin_password:/run/secrets/portainer_admin_password:ro
     labels:
       - traefik.enable=true
-      - traefik.http.routers.portainer.rule=Host(`${PORTAINER_HOST}`)
+      - traefik.http.routers.portainer.rule=Host(`\${PORTAINER_HOST}`)
       - traefik.http.routers.portainer.entrypoints=web,websecure
       - traefik.http.routers.portainer.tls=true
       - traefik.http.routers.portainer.tls.certresolver=mytlschallenge
@@ -318,6 +328,7 @@ for i in {1..30}; do
   sleep 2
 done
 
+# cria DB evolution (se faltar)
 echo "== Criando DB 'evolution' se não existir =="
 docker compose exec -T postgres psql -U "${N8N_DB_USER}" -d postgres -tc "SELECT 1 FROM pg_database WHERE datname='evolution'" | grep -q 1 \
   || docker compose exec -T postgres psql -U "${N8N_DB_USER}" -d postgres -c "CREATE DATABASE evolution OWNER ${N8N_DB_USER};"
@@ -352,12 +363,20 @@ echo
 c=$(code "https://${TRAEFIK_FQDN}") ; [[ "$c" =~ ^(200|301|302|401|403|404)$ ]] && ok "traefik (${c})" || fail "traefik (${c})"
 c=$(code "https://${PORTAINER_FQDN}") ; [[ "$c" =~ ^(200|301|302|401|403)$ ]] && ok "portainer (${c})" || fail "portainer (${c})"
 
+# n8n: tenta /healthz depois /rest/healthz
 c=$(code "https://${N8N_HOST}/healthz"); [[ "$c" == "200" ]] || c=$(code "https://${N8N_HOST}/rest/healthz")
 [[ "$c" == "200" ]] && ok "n8n (${c})" || fail "n8n (${c})"
 
+# evolution: raiz pode ser 200/404; endpoint tenta 3 variantes (v2 costuma ser /instance/fetchInstances)
 c=$(code "https://${EVO_HOST}") ; [[ "$c" =~ ^(200|404)$ ]] && ok "evolution (${c})" || fail "evolution (${c})"
 if [[ -n "$KEY" ]]; then
   c=$(curl -sk -H "apikey: $KEY" -o /dev/null -w '%{http_code}' "https://${EVO_HOST}/instance/fetchInstances")
+  if [[ "$c" != "200" ]]; then
+    c=$(curl -sk -H "apikey: $KEY" -o /dev/null -w '%{http_code}' "https://${EVO_HOST}/api/instance/fetchInstances")
+  fi
+  if [[ "$c" != "200" ]]; then
+    c=$(curl -sk -H "apikey: $KEY" -o /dev/null -w '%{http_code}' "https://${EVO_HOST}/v2/instance/fetchInstances")
+  fi
   [[ "$c" == "200" ]] && ok "fetchInstances (${c})" || fail "fetchInstances (${c})"
 fi
 echo "=== Done ==="
