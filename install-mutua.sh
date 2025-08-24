@@ -11,6 +11,7 @@
 #   - Corrige o problema do n8n ("Command start not found") com:
 #       * N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
 #       * fix de permissões + owner no volume do n8n (se já existir)
+#   - Define traefik.docker.network de forma explícita p/ evitar 502
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -30,6 +31,12 @@ bcrypt_hash() {
 require docker
 require openssl
 require curl
+
+# Fixa COMPOSE_PROJECT_NAME para nomear a rede previsivelmente (<projeto>_web)
+if [[ -z "${COMPOSE_PROJECT_NAME:-}" ]]; then
+  export COMPOSE_PROJECT_NAME="$(basename "$PWD")"
+fi
+TRAEFIK_DOCKER_NETWORK="${COMPOSE_PROJECT_NAME}_web"
 
 # ====================== perguntas =======================
 echo "== Configuração =="
@@ -84,6 +91,9 @@ EVOLUTION_API_KEY=${EVOLUTION_API_KEY}
 
 # Portainer
 PORTAINER_ADMIN_HASH=${PORTAINER_ADMIN_HASH}
+
+# Traefik <-> Docker network que o Traefik deve usar p/ alcançar os serviços
+TRAEFIK_DOCKER_NETWORK=${TRAEFIK_DOCKER_NETWORK}
 EOF
 echo "✅ .env escrito."
 
@@ -209,6 +219,7 @@ services:
       - traefik.http.middlewares.n8n.headers.STSPreload=true
       - traefik.http.routers.n8n.middlewares=n8n@docker
       - traefik.http.services.n8n.loadbalancer.server.port=5678
+      - traefik.docker.network=${TRAEFIK_DOCKER_NETWORK}
     networks: [ web ]
 
   n8n-worker:
@@ -256,6 +267,8 @@ services:
       SERVER_TYPE: "http"
       SERVER_SSL: "false"
       HTTPS: "false"
+      # Porta padrão 8080 (explícito por clareza)
+      SERVER_PORT: "8080"
 
       # Externo (QR/links) + WS/CORS
       SERVER_URL: https://${EVO_SUBDOMAIN}.${DOMAIN_NAME}
@@ -275,6 +288,7 @@ services:
       - traefik.http.routers.evolution.tls=true
       - traefik.http.routers.evolution.tls.certresolver=mytlschallenge
       - traefik.http.services.evolution.loadbalancer.server.port=8080
+      - traefik.docker.network=${TRAEFIK_DOCKER_NETWORK}
     networks: [ web ]
 
   portainer:
@@ -294,6 +308,7 @@ services:
       - traefik.http.routers.portainer.tls=true
       - traefik.http.routers.portainer.tls.certresolver=mytlschallenge
       - traefik.http.services.portainer.loadbalancer.server.port=9000
+      - traefik.docker.network=${TRAEFIK_DOCKER_NETWORK}
     networks: [ web ]
 
 volumes:
@@ -332,7 +347,6 @@ docker compose exec -T postgres psql -U "${N8N_DB_USER}" -d postgres -tc "SELECT
   || docker compose exec -T postgres psql -U "${N8N_DB_USER}" -d postgres -c "CREATE DATABASE evolution OWNER ${N8N_DB_USER};"
 
 # ======= fix preventivo de permissões do volume n8n =====
-# (Resolve "Permissions 0644 ... too wide" + casos de loop)
 VOLUME_N8N="$(docker volume ls --format '{{.Name}}' | grep '_n8n_data$' | head -n1 || true)"
 if [[ -n "${VOLUME_N8N}" ]]; then
   docker run --rm -v "${VOLUME_N8N}":/data alpine:3 sh -lc '
