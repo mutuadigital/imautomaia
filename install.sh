@@ -3,7 +3,7 @@
 # install.sh - Traefik v3 + Postgres + Redis + n8n (+ worker) + Evolution API + Portainer
 # Dashboards SEMPRE ativos:
 #   - Traefik (api@internal) com Basic Auth
-#   - Portainer com admin via --admin-password-file
+#   - Portainer com admin via --admin-password-file (senha em TEXTO, sem newline)
 #
 # Este instalador:
 #   - Reescreve o docker-compose.yml (faz backup do antigo)
@@ -12,6 +12,7 @@
 #       * N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
 #       * fix de permissões + owner no volume do n8n (se já existir)
 #   - Define traefik.docker.network de forma explícita p/ evitar 502
+#   - Corrige Portainer no primeiro boot: admin_password em TEXTO (sem newline)
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -23,9 +24,6 @@ ask() {
   else read -r -p "$prompt: " var || true; echo "$var"; fi
 }
 require() { command -v "$1" >/dev/null 2>&1 || { echo "Falta o comando '$1'."; exit 1; }; }
-bcrypt_hash() {
-  docker run --rm alpine:3 sh -lc 'apk add --no-cache apache2-utils >/dev/null && htpasswd -nbB admin "$1"' -- "$1" | cut -d: -f2-
-}
 
 # ===================== pré-checagens ====================
 require docker
@@ -64,7 +62,6 @@ HTPASS_HASH="$(openssl passwd -apr1 "$TRAEFIK_PASS")"
 
 read -r -s -p "Senha do Portainer (admin) (deixe vazio p/ gerar): " PORTAINER_ADMIN_PASS || true; echo
 [[ -z "${PORTAINER_ADMIN_PASS:-}" ]] && PORTAINER_ADMIN_PASS="$(randhex 12)"
-PORTAINER_ADMIN_HASH="$(bcrypt_hash "$PORTAINER_ADMIN_PASS")"
 
 N8N_ENCRYPTION_KEY="${N8N_ENCRYPTION_KEY:-$(randhex 24)}"
 
@@ -89,9 +86,6 @@ N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
 # Evolution
 EVOLUTION_API_KEY=${EVOLUTION_API_KEY}
 
-# Portainer
-PORTAINER_ADMIN_HASH=${PORTAINER_ADMIN_HASH}
-
 # Traefik <-> Docker network que o Traefik deve usar p/ alcançar os serviços
 TRAEFIK_DOCKER_NETWORK=${TRAEFIK_DOCKER_NETWORK}
 EOF
@@ -105,10 +99,12 @@ echo "${TRAEFIK_USER}:${HTPASS_HASH}" > traefik/htpasswd
 chmod 640 traefik/htpasswd
 echo "✅ htpasswd criado para painel Traefik (${TRAEFIK_USER})."
 
-# Portainer admin password (hash bcrypt) via arquivo
-printf '%s\n' "${PORTAINER_ADMIN_HASH}" > portainer/admin_password
+# Portainer admin password (EM TEXTO, SEM NEWLINE) via arquivo
+# (compatível com --admin-password-file no primeiro boot)
+# Importante: usar 'printf %s' para não gravar '\n' no final.
+printf %s "${PORTAINER_ADMIN_PASS}" > portainer/admin_password
 chmod 600 portainer/admin_password
-echo "✅ arquivo de senha do Portainer criado."
+echo "✅ arquivo de senha do Portainer criado (plaintext, sem newline)."
 
 # ============ docker-compose.yml (sempre novo) =========
 if [[ -f docker-compose.yml ]]; then
