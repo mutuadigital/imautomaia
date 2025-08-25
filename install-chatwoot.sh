@@ -177,23 +177,26 @@ networks:
     external: true
     name: root_web
 YAML
-# Substitui host nas labels
 CHATWOOT_HOST="${CHAT_SUB}.${DOMAIN_NAME}"
-sed -i "s|\`${CHATWOOT_HOST//\//\\/}\`|\`${CHATWOOT_HOST}\`|g" "$DC" || true
-if ! grep -q "Host(\`${CHATWOOT_HOST}\`)" "$DC"; then
-  sed -i "s|\`\\\${CHATWOOT_HOST}\`|\`${CHATWOOT_HOST}\`|g" "$DC"
-fi
+# Deixe o docker compose interpolar ${CHATWOOT_HOST} via .env do projeto:
+echo "CHATWOOT_HOST=${CHATWOOT_HOST}" > "$CW_DIR/.env"
+export CHATWOOT_HOST
 echo "✅ Compose salvo em: $DC"
 
 # ==== Rede web externa ====
 docker network inspect root_web >/dev/null 2>&1 || docker network create root_web >/dev/null
 
-# ==== Garante pgvector no Postgres do stack ====
-echo "=== Ativando pgvector no Postgres do stack ==="
+echo "=== Criando DB e ativando pgvector no Postgres do stack ==="
 PG_MAJOR=$(docker exec -i postgres psql -V | awk '{print $3}' | cut -d. -f1)
 docker exec -i postgres bash -lc "apt-get update >/dev/null && apt-get install -y postgresql-${PG_MAJOR}-pgvector >/dev/null"
-docker exec -i postgres psql -U "${PG_USER}" -d "${PG_DB}" -c 'CREATE EXTENSION IF NOT EXISTS vector;' >/dev/null \
-  || true
+
+# cria o DB se não existir
+docker exec -i postgres psql -U "${PG_USER}" -d postgres -tc "SELECT 1 FROM pg_database WHERE datname='${PG_DB}'" | grep -q 1 \
+  || docker exec -i postgres psql -U "${PG_USER}" -d postgres -c "CREATE DATABASE ${PG_DB} OWNER ${PG_USER};"
+
+# agora a extensão no DB correto
+docker exec -i postgres psql -U "${PG_USER}" -d "${PG_DB}" -c 'CREATE EXTENSION IF NOT EXISTS vector;' >/dev/null
+
 echo "✅ pgvector OK"
 
 # ==== Migrations ====
