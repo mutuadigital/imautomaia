@@ -2,13 +2,16 @@
 # -----------------------------------------------------------------------------
 # install.sh - Traefik v3 + Postgres + Redis + n8n (+ worker) + Evolution API + Portainer
 # Dashboards SEMPRE ativos:
-#   - Traefik (api@internal) com Basic Auth (usuário/senha definidos aqui)
-#   - Portainer com admin pré-configurado (hash bcrypt via --admin-password-file)
+#   - Traefik (api@internal) com Basic Auth
+#   - Portainer com admin via --admin-password-file
 #
 # Este instalador:
-#   - Faz backup do docker-compose.yml anterior (se existir) e escreve um NOVO, limpo e consistente
-#   - Coloca TODOS os serviços na mesma rede "web" (evita 504 por mismatch de rede)
-#   - Evita duplicar "command:" e evita variáveis não setadas em labels
+#   - Reescreve o docker-compose.yml (faz backup do antigo)
+#   - Coloca TODOS os serviços na mesma rede "web"
+#   - Corrige o problema do n8n ("Command start not found") com:
+#       * N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+#       * fix de permissões + owner no volume do n8n (se já existir)
+#   - Define traefik.docker.network de forma explícita p/ evitar 502
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -21,7 +24,6 @@ ask() {
 }
 require() { command -v "$1" >/dev/null 2>&1 || { echo "Falta o comando '$1'."; exit 1; }; }
 bcrypt_hash() {
-  # Gera bcrypt (htpasswd -B) dentro de container Alpine (sem depender de pacotes no host)
   docker run --rm alpine:3 sh -lc 'apk add --no-cache apache2-utils >/dev/null && htpasswd -nbB admin "$1"' -- "$1" | cut -d: -f2-
 }
 
@@ -30,13 +32,19 @@ require docker
 require openssl
 require curl
 
+# Fixa COMPOSE_PROJECT_NAME para nomear a rede previsivelmente (<projeto>_web)
+if [[ -z "${COMPOSE_PROJECT_NAME:-}" ]]; then
+  export COMPOSE_PROJECT_NAME="$(basename "$PWD")"
+fi
+TRAEFIK_DOCKER_NETWORK="${COMPOSE_PROJECT_NAME}_web"
+
 # ====================== perguntas =======================
 echo "== Configuração =="
 DOMAIN_NAME="$(ask "Domínio raiz (ex.: imautomaia.com.br)" "${DOMAIN_NAME:-}")"
 SUBDOMAIN="$(ask "Subdomínio do n8n" "${SUBDOMAIN:-n8n}")"
 EVO_SUBDOMAIN="$(ask "Subdomínio da Evolution" "${EVO_SUBDOMAIN:-wa}")"
 GENERIC_TIMEZONE="$(ask "Timezone" "${GENERIC_TIMEZONE:-America/Sao_Paulo}")"
-SSL_EMAIL="$(ask "Email para Let's Encrypt" "${SSL_EMAIL:-you@example.com}")"
+SSL_EMAIL="$(ask "Email para Let's Encrypt (ex.: seu-email@gmail.com)" "${SSL_EMAIL:-}")"
 
 PORTAINER_HOST="$(ask "Host do Portainer (FQDN)" "${PORTAINER_HOST:-portainer.${DOMAIN_NAME}}")"
 TRAEFIK_HOST="$(ask "Host do Traefik (FQDN)" "${TRAEFIK_HOST:-traefik.${DOMAIN_NAME}}")"
@@ -56,7 +64,7 @@ HTPASS_HASH="$(openssl passwd -apr1 "$TRAEFIK_PASS")"
 
 read -r -s -p "Senha do Portainer (admin) (deixe vazio p/ gerar): " PORTAINER_ADMIN_PASS || true; echo
 [[ -z "${PORTAINER_ADMIN_PASS:-}" ]] && PORTAINER_ADMIN_PASS="$(randhex 12)"
-PORTAINER_ADMIN_HASH="$(bcrypt_hash "$PORTAINER_ADMIN_PASS")"  # exigido por --admin-password-file
+PORTAINER_ADMIN_HASH="$(bcrypt_hash "$PORTAINER_ADMIN_PASS")"
 
 N8N_ENCRYPTION_KEY="${N8N_ENCRYPTION_KEY:-$(randhex 24)}"
 
@@ -83,6 +91,9 @@ EVOLUTION_API_KEY=${EVOLUTION_API_KEY}
 
 # Portainer
 PORTAINER_ADMIN_HASH=${PORTAINER_ADMIN_HASH}
+
+# Traefik <-> Docker network que o Traefik deve usar p/ alcançar os serviços
+TRAEFIK_DOCKER_NETWORK=${TRAEFIK_DOCKER_NETWORK}
 EOF
 echo "✅ .env escrito."
 
@@ -160,27 +171,34 @@ services:
     networks: [ web ]
 
   n8n:
-    image: docker.n8n.io/n8nio/n8n
+    image: n8nio/n8n:latest
     container_name: n8n
     restart: always
     environment:
+      # Base URL
       N8N_HOST: ${SUBDOMAIN}.${DOMAIN_NAME}
       N8N_PROTOCOL: https
       N8N_PORT: 5678
       WEBHOOK_URL: https://${SUBDOMAIN}.${DOMAIN_NAME}/
+
+      # DB (Postgres)
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: postgres
       DB_POSTGRESDB_PORT: 5432
       DB_POSTGRESDB_DATABASE: ${N8N_DB_NAME}
       DB_POSTGRESDB_USER: ${N8N_DB_USER}
       DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASS}
-      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE}
+
+      # Queue (Redis)
       EXECUTIONS_MODE: queue
       QUEUE_BULL_REDIS_HOST: redis
       QUEUE_BULL_REDIS_PORT: 6379
-      N8N_RUNNERS_ENABLED: "true"
-      OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS: "true"
+
+      # Segurança/Permissões
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE}
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_DIAGNOSTICS_ENABLED: "false"
     volumes:
       - n8n_data:/home/node/.n8n
       - /local-files:/files
@@ -201,10 +219,11 @@ services:
       - traefik.http.middlewares.n8n.headers.STSPreload=true
       - traefik.http.routers.n8n.middlewares=n8n@docker
       - traefik.http.services.n8n.loadbalancer.server.port=5678
+      - traefik.docker.network=${TRAEFIK_DOCKER_NETWORK}
     networks: [ web ]
 
   n8n-worker:
-    image: docker.n8n.io/n8nio/n8n
+    image: n8nio/n8n:latest
     container_name: n8n-worker
     restart: always
     command: worker
@@ -219,6 +238,7 @@ services:
       DB_POSTGRESDB_USER: ${N8N_DB_USER}
       DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASS}
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
     depends_on: [ redis, postgres ]
     networks: [ web ]
 
@@ -247,6 +267,8 @@ services:
       SERVER_TYPE: "http"
       SERVER_SSL: "false"
       HTTPS: "false"
+      # Porta padrão 8080 (explícito por clareza)
+      SERVER_PORT: "8080"
 
       # Externo (QR/links) + WS/CORS
       SERVER_URL: https://${EVO_SUBDOMAIN}.${DOMAIN_NAME}
@@ -266,6 +288,7 @@ services:
       - traefik.http.routers.evolution.tls=true
       - traefik.http.routers.evolution.tls.certresolver=mytlschallenge
       - traefik.http.services.evolution.loadbalancer.server.port=8080
+      - traefik.docker.network=${TRAEFIK_DOCKER_NETWORK}
     networks: [ web ]
 
   portainer:
@@ -285,6 +308,7 @@ services:
       - traefik.http.routers.portainer.tls=true
       - traefik.http.routers.portainer.tls.certresolver=mytlschallenge
       - traefik.http.services.portainer.loadbalancer.server.port=9000
+      - traefik.docker.network=${TRAEFIK_DOCKER_NETWORK}
     networks: [ web ]
 
 volumes:
@@ -322,6 +346,18 @@ echo "== Criando DB 'evolution' se não existir =="
 docker compose exec -T postgres psql -U "${N8N_DB_USER}" -d postgres -tc "SELECT 1 FROM pg_database WHERE datname='evolution'" | grep -q 1 \
   || docker compose exec -T postgres psql -U "${N8N_DB_USER}" -d postgres -c "CREATE DATABASE evolution OWNER ${N8N_DB_USER};"
 
+# ======= fix preventivo de permissões do volume n8n =====
+VOLUME_N8N="$(docker volume ls --format '{{.Name}}' | grep '_n8n_data$' | head -n1 || true)"
+if [[ -n "${VOLUME_N8N}" ]]; then
+  docker run --rm -v "${VOLUME_N8N}":/data alpine:3 sh -lc '
+    set -e
+    mkdir -p /data
+    chown -R 1000:1000 /data || true
+    chmod 700 /data || true
+    if [ -f /data/config ]; then chmod 600 /data/config || true; fi
+  ' || true
+fi
+
 # =================== sobe apps ==========================
 echo "== Subindo n8n / worker / Portainer =="
 docker compose up -d n8n n8n-worker portainer
@@ -358,6 +394,12 @@ c=$(code "https://${N8N_HOST}/healthz"); [[ "$c" == "200" ]] || c=$(code "https:
 c=$(code "https://${EVO_HOST}") ; [[ "$c" =~ ^(200|404)$ ]] && ok "evolution (${c})" || fail "evolution (${c})"
 if [[ -n "$KEY" ]]; then
   c=$(curl -sk -H "apikey: $KEY" -o /dev/null -w '%{http_code}' "https://${EVO_HOST}/instance/fetchInstances")
+  if [[ "$c" != "200" ]]; then
+    c=$(curl -sk -H "apikey: $KEY" -o /dev/null -w '%{http_code}' "https://${EVO_HOST}/api/instance/fetchInstances")
+  fi
+  if [[ "$c" != "200" ]]; then
+    c=$(curl -sk -H "apikey: $KEY" -o /dev/null -w '%{http_code}' "https://${EVO_HOST}/v2/instance/fetchInstances")
+  fi
   [[ "$c" == "200" ]] && ok "fetchInstances (${c})" || fail "fetchInstances (${c})"
 fi
 echo "=== Done ==="
