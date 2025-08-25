@@ -6,20 +6,46 @@ CW_DIR="$ROOT/chatwoot"
 mkdir -p "$CW_DIR"
 cd "$CW_DIR"
 
-# Tenta herdar credenciais do stack principal
+# Tenta herdar credenciais do stack principal (SEM dar 'source')
 ENV_MAIN="$ROOT/.env"
-[[ -f "$ENV_MAIN" ]] && source "$ENV_MAIN" || true
 
-DOMAIN_NAME_DEFAULT="${DOMAIN_NAME:-example.com}"
+get_env () {
+  # Lê valor de uma KEY=VAL no .env sem expandir $, ignora CR/LF e espaços
+  local key="$1" file="$ENV_MAIN"
+  [[ -f "$file" ]] || { echo ""; return 0; }
+  awk -v k="$key" -F'=' '
+    $1==k {
+      $1="";
+      sub(/^=/,"");
+      gsub(/\r/,"");
+      sub(/^[ \t]+/,"");
+      sub(/[ \t]+$/,"");
+      print; exit
+    }' "$file"
+}
+
+DOMAIN_NAME_DEFAULT="$(get_env DOMAIN_NAME)"
+[[ -z "$DOMAIN_NAME_DEFAULT" ]] && DOMAIN_NAME_DEFAULT="example.com"
+
 CHAT_SUB_DEFAULT="chat"
-TZ_DEFAULT="${GENERIC_TIMEZONE:-America/Sao_Paulo}"
+
+TZ_DEFAULT="$(get_env GENERIC_TIMEZONE)"
+[[ -z "$TZ_DEFAULT" ]] && TZ_DEFAULT="America/Sao_Paulo"
 
 PG_HOST_DEFAULT="postgres"
 PG_PORT_DEFAULT="5432"
-PG_USER_DEFAULT="${N8N_DB_USER:-n8n}"
-PG_PASS_DEFAULT="${N8N_DB_PASS:-changeme}"
+PG_USER_DEFAULT="$(get_env N8N_DB_USER)"
+[[ -z "$PG_USER_DEFAULT" ]] && PG_USER_DEFAULT="n8n"
+
+PG_PASS_DEFAULT="$(get_env N8N_DB_PASS)"
+[[ -z "$PG_PASS_DEFAULT" ]] && PG_PASS_DEFAULT="changeme"
+
 PG_DB_DEFAULT="chatwoot_production"
 REDIS_URL_DEFAULT="redis://redis:6379"
+
+# opcional: herdar EVO_SUBDOMAIN para o echo final (se existir)
+EVO_SUB_FROM_ENV="$(get_env EVO_SUBDOMAIN)"
+[[ -n "$EVO_SUB_FROM_ENV" ]] && export EVO_SUBDOMAIN="$EVO_SUB_FROM_ENV"
 
 echo "=== Chatwoot - Configuração Rápida ==="
 read -rp "Domínio (ex.: imautomaia.com.br) [$DOMAIN_NAME_DEFAULT]: " DOMAIN_NAME
