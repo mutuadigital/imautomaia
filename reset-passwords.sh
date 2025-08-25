@@ -3,44 +3,52 @@ set -euo pipefail
 
 # ----------------------------------------------------------
 # reset-passwords.sh
-# - Reseta senha do Traefik (BasicAuth via htpasswd)
-# - Reseta senha do Portainer (zerando o volume de dados)
-# - Anota as novas credenciais em CREDENCIAIS.txt (chmod 600)
-# - NÃO altera sua stack além do necessário
+# - Reseta senha do Traefik (BasicAuth via htpasswd/bcrypt)
+# - Reseta senha do Portainer (admin) usando --admin-password-file
+#   *agora em TEXTO PURO, SEM newline*
+# - Remove todos os volumes portainer_data pra garantir 1º boot
+# - Anota tudo em CREDENCIAIS.txt (chmod 600)
+# - NÃO dá 'source' no .env (evita bug com $2y$ do bcrypt)
 # ----------------------------------------------------------
 
 require() { command -v "$1" >/dev/null 2>&1 || { echo "Falta o comando '$1'."; exit 1; }; }
 require docker
 require openssl
 
-# Tenta carregar variáveis úteis do .env (se existir)
-ENV_FILE=""
-for f in "./.env" "/root/.env"; do
-  [[ -f "$f" ]] && ENV_FILE="$f" && break
-done
-if [[ -n "$ENV_FILE" ]]; then
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-fi
-
-# Valores padrão (usados se não vierem do .env)
-TRAEFIK_USER="${TRAEFIK_USER:-admin}"
-TRAEFIK_HOST="${TRAEFIK_HOST:-traefik.${DOMAIN_NAME:-localhost}}"
-PORTAINER_HOST="${PORTAINER_HOST:-portainer.${DOMAIN_NAME:-localhost}}"
-
-# Helpers
-htpasswd_line() {
-  # Gera UMA linha de htpasswd (user:hash) com bcrypt usando imagem httpd
-  local user="$1" pass="$2"
-  docker run --rm httpd:2.4-alpine htpasswd -nbB "$user" "$pass"
+# Lê um valor do .env (se existir) sem executar nada
+get_env() {
+  local key="$1" def="${2:-}" file="" val=""
+  for f in "./.env" "/root/.env"; do [[ -f "$f" ]] && file="$f" && break; done
+  [[ -z "$file" ]] && { echo "$def"; return 0; }
+  val="$(awk -v k="$key" -F'=' '
+    $1==k {
+      $1="";
+      sub(/^=/,"");
+      gsub(/\r/,"");
+      sub(/^[ \t]+/,"");
+      sub(/[ \t]+$/,"");
+      print; exit
+    }' "$file" 2>/dev/null || true)"
+  [[ -n "$val" ]] && echo "$val" || echo "$def"
 }
 
-bcrypt_hash_only() {
-  # Gera APENAS o hash (sem "user:") com apache2-utils (em Alpine)
-  local pass="$1"
-  docker run --rm alpine:3 sh -lc \
-    'apk add --no-cache apache2-utils >/dev/null && htpasswd -nbB admin "$1" | cut -d: -f2-' -- "$pass"
+# Garante que uma KEY exista no .env (se não existir, adiciona)
+ensure_env_key() {
+  local key="$1" val="$2" file=""
+  for f in "./.env" "/root/.env"; do [[ -f "$f" ]] && file="$f" && break; done
+  [[ -z "$file" ]] && return 0
+  grep -qE "^${key}=" "$file" || printf '%s=%s\n' "$key" "$val" >> "$file"
 }
+
+DOMAIN_NAME="$(get_env DOMAIN_NAME "")"
+TRAEFIK_HOST="$(get_env TRAEFIK_HOST "traefik.${DOMAIN_NAME:-localhost}")"
+PORTAINER_HOST="$(get_env PORTAINER_HOST "portainer.${DOMAIN_NAME:-localhost}")"
+TRAEFIK_USER="$(get_env TRAEFIK_USER "admin")"
+[[ -z "$TRAEFIK_USER" ]] && TRAEFIK_USER="admin"
+ensure_env_key "TRAEFIK_USER" "$TRAEFIK_USER"
+
+# Helpers de hash
+htpasswd_line() { docker run --rm httpd:2.4-alpine htpasswd -nbB "$1" "$2"; }
 
 divider() { printf '\n%s\n' "----------------------------------------------------------"; }
 
@@ -53,52 +61,52 @@ divider
 echo "1) Traefik: gerando nova senha e atualizando htpasswd…"
 TRAEFIK_NEW_PASS="$(openssl rand -hex 12)"
 mkdir -p traefik
-# linha no formato "user:hash"
-HTPASSWD_LINE="$(htpasswd_line "$TRAEFIK_USER" "$TRAEFIK_NEW_PASS")"
-printf '%s\n' "$HTPASSWD_LINE" > traefik/htpasswd
+printf '%s\n' "$(htpasswd_line "$TRAEFIK_USER" "$TRAEFIK_NEW_PASS")" > traefik/htpasswd
 chmod 640 traefik/htpasswd
-echo " - htpasswd atualizado (usuario: ${TRAEFIK_USER})"
-echo " - reiniciando Traefik…"
-docker compose restart traefik >/dev/null
-echo " ✓ Traefik reiniciado"
+docker compose restart traefik >/dev/null || true
+echo " ✓ Traefik reiniciado (user: ${TRAEFIK_USER})"
 
 # =====================================================================
-# 2) PORTAINER - zera volume de dados e sobe novamente com novo hash
+# 2) PORTAINER - 1º boot limpo + senha em TEXTO no admin_password
 #     (ATENÇÃO: apaga configurações do Portainer; apenas o Portainer)
 # =====================================================================
 divider
-echo "2) Portainer: resetando base e definindo nova senha admin…"
+echo "2) Portainer: resetando base e definindo nova senha admin (plaintext)…"
 PORTAINER_NEW_PASS="$(openssl rand -hex 12)"
 mkdir -p portainer
-PORTAINER_HASH="$(bcrypt_hash_only "$PORTAINER_NEW_PASS")"
-printf '%s\n' "$PORTAINER_HASH" > portainer/admin_password
+# >>> grava SENHA EM TEXTO, SEM newline <<<
+printf %s "${PORTAINER_NEW_PASS}" > portainer/admin_password
 chmod 600 portainer/admin_password
-echo " - arquivo ./portainer/admin_password atualizado"
+echo " - arquivo ./portainer/admin_password atualizado (plaintext)"
 
-# Descobre volume de dados do Portainer (ex.: <projeto>_portainer_data)
-PORTAINER_VOL="$(docker volume ls --format '{{.Name}}' | grep -E '_portainer_data$|^portainer_data$' | head -n1 || true)"
-if [[ -z "${PORTAINER_VOL}" ]]; then
-  echo " ! Volume do Portainer não encontrado automaticamente."
-  echo "   Tentando subir e deixar o Docker recriar com o arquivo de senha novo…"
-else
-  echo " - parando/removendo container portainer…"
-  docker stop portainer >/dev/null 2>&1 || true
-  docker rm portainer >/dev/null 2>&1 || true
-  echo " - removendo volume ${PORTAINER_VOL}… (reset)"
-  docker volume rm "${PORTAINER_VOL}" >/dev/null 2>&1 || true
-fi
+echo " - parando/removendo container portainer…"
+docker stop portainer >/dev/null 2>&1 || true
+docker rm portainer   >/dev/null 2>&1 || true
+
+echo " - removendo TODOS os volumes portainer_data…"
+for v in $(docker volume ls --format '{{.Name}}' | grep -E '(^|_)portainer_data$' || true); do
+  docker volume rm -f "$v" >/dev/null 2>&1 || true
+done
 
 echo " - subindo Portainer novamente…"
 docker compose up -d portainer >/dev/null
-echo " ✓ Portainer reiniciado (leu a nova senha admin da primeira inicialização)"
+
+# Validação rápida de leitura do secret (opcional, mas útil)
+echo " - checando leitura do secret (plaintext)…"
+docker run --rm -v "$PWD/portainer/admin_password:/run/secrets/admin:ro" alpine:3 \
+  sh -lc 'test -s /run/secrets/admin && { printf "   conteúdo (primeiros 6 chars): "; head -c6 /run/secrets/admin; echo; } || { echo "   ERRO: secret vazio/inlegível"; exit 1; }'
+
+sleep 3
+docker logs --since 10s portainer || true
 
 # =====================================================================
 # 3) GRAVAÇÃO DAS CREDENCIAIS
 # =====================================================================
 divider
 CRED_FILE="CREDENCIAIS.txt"
+NOW="$(date '+%Y-%m-%d %H:%M:%S')"
 {
-  echo "[${(date +%F' '%T) 2>/dev/null || date}]"
+  echo "[$NOW]"
   echo "Traefik:"
   echo "  - URL : https://${TRAEFIK_HOST}"
   echo "  - user: ${TRAEFIK_USER}"
@@ -110,7 +118,6 @@ CRED_FILE="CREDENCIAIS.txt"
   echo "  - pass: ${PORTAINER_NEW_PASS}"
 } > "${CRED_FILE}"
 chmod 600 "${CRED_FILE}"
-
 echo "✓ Credenciais anotadas em ${CRED_FILE} (chmod 600)"
 
 divider
@@ -119,4 +126,6 @@ echo "Traefik   → https://${TRAEFIK_HOST}   (user: ${TRAEFIK_USER} / pass: ${T
 echo "Portainer → https://${PORTAINER_HOST}   (user: admin / pass: ${PORTAINER_NEW_PASS})"
 echo "Arquivo   → ${CRED_FILE}"
 divider
-echo "Dica: se o navegador estiver guardando cache de auth, abra em aba anônima."
+echo "Se o navegador recusar, teste primeiro a API:"
+echo "  curl -sS -H 'Content-Type: application/json' --data '{\"username\":\"admin\",\"password\":\"${PORTAINER_NEW_PASS}\"}' https://${PORTAINER_HOST}/api/auth"
+echo "e tente em aba anônima (cookies antigos podem atrapalhar)."
